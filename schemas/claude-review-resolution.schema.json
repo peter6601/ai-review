@@ -1,0 +1,38 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["summary", "resolutions", "risk_flags"],
+  "properties": {
+    "summary": {"type": "string", "minLength": 1},
+    "resolutions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["finding_id", "outcome", "evidence"],
+        "properties": {
+          "finding_id": {"type": "string", "minLength": 1},
+          "outcome": {"type": "string", "enum": ["fixed", "not_reproduced", "needs_user_input", "disputed"]},
+          "evidence": {"type": "string", "minLength": 1}
+        }
+      }
+    },
+    "risk_flags": {
+      "type": "array",
+      "maxItems": 16,
+      "items": {
+        "type": "string",
+        "enum": [
+          "dependencies",
+          "migration",
+          "entitlements_signing",
+          "ci_cd",
+          "public_api",
+          "persistent_format",
+          "network_format"
+        ]
+      }
+    }
+  }
+}

@@ -1,0 +1,34 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["verdict", "summary", "findings", "questions", "context_requests"],
+  "properties": {
+    "verdict": {"type": "string", "enum": ["PASS", "CHANGES_REQUIRED", "NEEDS_USER_INPUT", "CONTEXT_REQUEST"]},
+    "summary": {"type": "string", "minLength": 1},
+    "questions": {"type": "array", "items": {"type": "string", "minLength": 1}},
+    "context_requests": {"type": "array", "items": {"type": "string", "minLength": 1}},
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "severity", "invariant", "location", "evidence", "required_outcome", "lineage"],
+        "properties": {
+          "id": {"type": "string", "minLength": 1},
+          "severity": {"type": "string", "enum": ["blocker", "major", "minor", "info"]},
+          "invariant": {"type": "string", "minLength": 1},
+          "location": {"type": "string", "minLength": 1},
+          "evidence": {"type": "string", "minLength": 1},
+          "required_outcome": {"type": "string", "minLength": 1},
+          "lineage": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["resolution"],
+            "properties": {"resolution": {"type": "string", "minLength": 1}}
+          }
+        }
+      }
+    }
+  }
+}

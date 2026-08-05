@@ -1,0 +1,52 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["profile", "patch_digest", "specialists"],
+  "properties": {
+    "profile": {"type": "string", "const": "ios"},
+    "patch_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "specialists": {
+      "type": "array",
+      "minItems": 3,
+      "maxItems": 3,
+      "uniqueItems": true,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "findings"],
+        "properties": {
+          "name": {
+            "type": "string",
+            "enum": ["swiftui-reviewer", "ux-critique", "resilience-auditor"]
+          },
+          "findings": {
+            "type": "array",
+            "maxItems": 20,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "id", "severity", "category", "location",
+                "evidence", "required_outcome", "risk_flags"
+              ],
+              "properties": {
+                "id": {"type": "string", "minLength": 1, "maxLength": 1000},
+                "severity": {"type": "string", "enum": ["blocker", "major", "minor"]},
+                "category": {"type": "string", "enum": ["swiftui", "ux", "resilience"]},
+                "location": {"type": "string", "minLength": 1, "maxLength": 1000},
+                "evidence": {"type": "string", "minLength": 1, "maxLength": 1000},
+                "required_outcome": {"type": "string", "minLength": 1, "maxLength": 1000},
+                "risk_flags": {
+                  "type": "array",
+                  "maxItems": 8,
+                  "items": {"type": "string", "minLength": 1, "maxLength": 1000}
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

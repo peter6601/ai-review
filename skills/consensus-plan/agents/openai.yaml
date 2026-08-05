@@ -1,0 +1,4 @@
+interface:
+  display_name: "Consensus Plan"
+  short_description: "Human-gated Plan consensus workflow"
+  default_prompt: "Use $consensus-plan to review this approved requirement before implementation."

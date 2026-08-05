@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+.skill-backups/
+.DS_Store
+.ai-review/

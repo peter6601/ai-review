@@ -1,0 +1,4 @@
+interface:
+  display_name: "Consensus Review"
+  short_description: "Codex-first review of existing local code with bounded repair"
+  default_prompt: "Review existing local code directly with Codex and bounded Claude repair; do not require a Plan."
