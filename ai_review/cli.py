@@ -20,7 +20,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
-from typing import Any, Callable, Iterable, Mapping, Optional
+from typing import Any, Callable, Iterable, Mapping, NoReturn, Optional
 
 from .context import SourceRef, build_packet
 from .git_diff import capture_diff_bytes
@@ -50,6 +50,23 @@ EXTERNAL_CALL_TIMEOUT = 1800
 _DIGEST = re.compile(r"^[0-9a-f]{64}$")
 _SECRET = re.compile(r"(?:sk-[A-Za-z0-9_-]{16,}|-----BEGIN [A-Z ]+-----|(?i:api[_-]?key|token|secret|password)\s*[:=]\s*[^\s]+)")
 _ROOT = Path(__file__).resolve().parent.parent
+
+
+def _raise_user_presence_failure(completed: "subprocess.CompletedProcess[str]") -> NoReturn:
+    """Distinguish a real Cancel click from the dialog never appearing at all.
+
+    osascript exits non-zero for both, so reporting every failure as "cancelled"
+    hides tool bugs as user intent. A real cancel carries AppleScript error
+    "(-128)"; anything else (syntax error, no GUI session) is our problem, not
+    the human's.
+    """
+    detail = (completed.stderr or "").strip()
+    if detail and "(-128)" not in detail:
+        raise CliInputError(
+            "local user-presence approval could not be displayed "
+            "(the dialog never appeared): %s" % detail
+        )
+    raise CliInputError("human approval was cancelled")
 
 
 class CliInputError(ValueError):
@@ -497,16 +514,16 @@ class MacOSHumanApprovalProvider:
         message = "Approve Code work for Plan run %s?\\n\\nPlan digest:\\n%s\\n\\nFrozen base OID:\\n%s\\n\\nVerification digest:\\n%s\\n\\nExact verification argv:\\n%s" % (
             run_id, plan_digest, base_oid, verification_digest, rendered,
         )
-        script = "display dialog %s buttons {\"Cancel\", \"Approve\"} default button \"Cancel\" cancel button \"Cancel\" with icon caution" % json.dumps(message)
+        script = "display dialog %s buttons {\"Cancel\", \"Approve\"} default button \"Cancel\" cancel button \"Cancel\" with icon caution" % json.dumps(message, ensure_ascii=False)
         try:
             completed = subprocess.run(
                 ["/usr/bin/osascript", "-e", script], check=False, stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL, text=True, timeout=120,
+                stderr=subprocess.PIPE, text=True, timeout=120,
             )
         except (OSError, subprocess.TimeoutExpired) as error:
             raise CliInputError("independent local user-presence approval is unavailable") from error
         if completed.returncode != 0 or "Approve" not in completed.stdout:
-            raise CliInputError("human approval was cancelled")
+            _raise_user_presence_failure(completed)
         return HumanApprovalReceipt(
             run_id=run_id, plan_digest=plan_digest, base_oid=base_oid, approved_at=_utc_now(),
             provider="macos:osascript-user-presence", actor="local-macos-user",
@@ -519,16 +536,16 @@ class MacOSHumanApprovalProvider:
         message = "Approve local Code candidate for run %s?\\n\\nCandidate digest:\\n%s" % (
             run_id, candidate_digest,
         )
-        script = "display dialog %s buttons {\"Cancel\", \"Approve\"} default button \"Cancel\" cancel button \"Cancel\" with icon caution" % json.dumps(message)
+        script = "display dialog %s buttons {\"Cancel\", \"Approve\"} default button \"Cancel\" cancel button \"Cancel\" with icon caution" % json.dumps(message, ensure_ascii=False)
         try:
             completed = subprocess.run(
                 ["/usr/bin/osascript", "-e", script], check=False, stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL, text=True, timeout=120,
+                stderr=subprocess.PIPE, text=True, timeout=120,
             )
         except (OSError, subprocess.TimeoutExpired) as error:
             raise CliInputError("independent local user-presence approval is unavailable") from error
         if completed.returncode != 0 or "Approve" not in completed.stdout:
-            raise CliInputError("human approval was cancelled")
+            _raise_user_presence_failure(completed)
         return {
             "approved_at": _utc_now(), "provider": "macos:osascript-user-presence",
             "actor": "local-macos-user",
@@ -553,17 +570,17 @@ class MacOSHumanApprovalProvider:
         script = (
             "display dialog %s buttons {\"Cancel\", \"Approve\"} "
             "default button \"Cancel\" cancel button \"Cancel\" with icon caution"
-        ) % json.dumps(message)
+        ) % json.dumps(message, ensure_ascii=False)
         try:
             completed = subprocess.run(
                 ["/usr/bin/osascript", "-e", script], check=False,
-                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                 timeout=120,
             )
         except (OSError, subprocess.TimeoutExpired) as error:
             raise CliInputError("independent local user-presence approval is unavailable") from error
         if completed.returncode != 0 or "Approve" not in completed.stdout:
-            raise CliInputError("human approval was cancelled")
+            _raise_user_presence_failure(completed)
         return ReviewApprovalReceipt(
             run_id=run_id, manifest_digest=manifest_digest, approved_at=_utc_now(),
             provider="macos:osascript-user-presence", actor="local-macos-user",
@@ -582,17 +599,17 @@ class MacOSHumanApprovalProvider:
         script = (
             "display dialog %s buttons {\"Cancel\", \"Approve\"} "
             "default button \"Cancel\" cancel button \"Cancel\" with icon caution"
-        ) % json.dumps(message)
+        ) % json.dumps(message, ensure_ascii=False)
         try:
             completed = subprocess.run(
                 ["/usr/bin/osascript", "-e", script], check=False,
-                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                 timeout=120,
             )
         except (OSError, subprocess.TimeoutExpired) as error:
             raise CliInputError("independent local user-presence approval is unavailable") from error
         if completed.returncode != 0 or "Approve" not in completed.stdout:
-            raise CliInputError("human approval was cancelled")
+            _raise_user_presence_failure(completed)
         return RiskApprovalReceipt(
             run_id=run_id, manifest_digest=manifest_digest, patch_digest=patch_digest,
             categories=tuple(sorted(set(categories))), approved_at=_utc_now(),

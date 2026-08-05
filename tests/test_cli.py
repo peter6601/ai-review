@@ -296,7 +296,9 @@ class CliContractTests(unittest.TestCase):
 
         def cancel_osascript(argv, *args, **kwargs):
             if argv[0] == "/usr/bin/osascript":
-                return subprocess.CompletedProcess(argv, 1, "", "cancelled")
+                return subprocess.CompletedProcess(
+                    argv, 1, "", "45:52: execution error: User canceled. (-128)"
+                )
             return original_run(argv, *args, **kwargs)
 
         with patch("ai_review.cli.platform.system", return_value="Darwin"), patch(
@@ -446,7 +448,9 @@ class CliContractTests(unittest.TestCase):
 
         def cancel(argv, *args, **kwargs):
             if argv[0] == "/usr/bin/osascript":
-                return subprocess.CompletedProcess(argv, 1, "", "cancelled")
+                return subprocess.CompletedProcess(
+                    argv, 1, "", "45:52: execution error: User canceled. (-128)"
+                )
             return original_run(argv, *args, **kwargs)
 
         with patch("ai_review.cli.platform.system", return_value="Darwin"), patch(
@@ -1145,3 +1149,125 @@ class CliContractTests(unittest.TestCase):
         self.assertEqual(stdout, "")
         self.assertNotIn("Traceback", stderr)
         self.assertNotIn("should-not-escape", stderr)
+
+
+class UserPresenceDialogRegressionTests(unittest.TestCase):
+    """Defect #4: approval dialogs must survive non-ASCII message content.
+
+    json.dumps without ensure_ascii=False escapes non-ASCII to \\uXXXX, which
+    AppleScript string literals reject as a syntax error, so the dialog never
+    appeared — and stderr=DEVNULL then disguised the broken tool as a human
+    Cancel. Every prior test mocked subprocess.run, so "the generated string
+    is legal AppleScript" was never asserted anywhere; that missing assertion
+    is exactly how the defect survived the whole suite. These tests run the
+    real script-building code and only fake the osascript execution.
+    """
+
+    NON_ASCII = "核可測試：中文內容"
+
+    def gate_calls(self):
+        from ai_review.cli import MacOSHumanApprovalProvider
+
+        provider = MacOSHumanApprovalProvider()
+        verification = [{
+            "kind": "test",
+            "argv": ["swift", "test", "--filter", self.NON_ASCII],
+            "scope": self.NON_ASCII,
+        }]
+        return (
+            ("approve-plan", lambda: provider.approve(
+                run_id="run-1", plan_digest="a" * 64, base_oid="b" * 40,
+                verification_commands=verification, verification_digest="c" * 64,
+            )),
+            # approve_code's message only carries run_id and digest; the
+            # non-ASCII run_id is a property probe, not a production shape.
+            ("approve-code", lambda: provider.approve_code(
+                run_id="run-%s" % self.NON_ASCII, candidate_digest="d" * 64,
+            )),
+            ("approve-review", lambda: provider.approve_review(
+                run_id="run-1", manifest_digest="e" * 64, brief=self.NON_ASCII,
+                base_oid="b" * 40, initial_patch_digest="f" * 64,
+                verification_commands=verification,
+            )),
+            ("approve-risk", lambda: provider.approve_risk(
+                run_id="run-1", manifest_digest="e" * 64, patch_digest="f" * 64,
+                categories=["migration"],
+                paths=["Sources/%s.swift" % self.NON_ASCII],
+            )),
+        )
+
+    def captured_dialog(self, invoke):
+        calls = []
+
+        def fake_run(argv, **kwargs):
+            calls.append((argv, kwargs))
+            return subprocess.CompletedProcess(argv, 0, "button returned:Approve", "")
+
+        with patch("ai_review.cli.platform.system", return_value="Darwin"), patch(
+            "ai_review.cli.subprocess.run", side_effect=fake_run,
+        ):
+            invoke()
+        self.assertEqual(len(calls), 1)
+        argv, kwargs = calls[0]
+        self.assertEqual(argv[:2], ["/usr/bin/osascript", "-e"])
+        return argv[2], kwargs
+
+    def test_non_ascii_dialog_text_stays_literal_in_every_gate(self):
+        for name, invoke in self.gate_calls():
+            with self.subTest(gate=name):
+                script, _kwargs = self.captured_dialog(invoke)
+                self.assertIn(self.NON_ASCII, script)
+                self.assertNotIn("\\u", script)
+
+    def test_every_gate_generates_compilable_applescript(self):
+        # osacompile checks syntax without displaying anything; a \uXXXX
+        # escape in the dialog text fails compilation exactly as it failed
+        # osascript at approval time.
+        if not Path("/usr/bin/osacompile").exists():
+            self.skipTest("/usr/bin/osacompile unavailable")
+        for name, invoke in self.gate_calls():
+            with self.subTest(gate=name):
+                script, _kwargs = self.captured_dialog(invoke)
+                with tempfile.TemporaryDirectory() as raw:
+                    source = Path(raw) / "dialog.applescript"
+                    source.write_text(script + "\n", encoding="utf-8")
+                    compiled = subprocess.run(
+                        [
+                            "/usr/bin/osacompile",
+                            "-o", str(Path(raw) / "dialog.scpt"), str(source),
+                        ],
+                        capture_output=True, text=True, check=False,
+                    )
+                self.assertEqual(compiled.returncode, 0, compiled.stderr)
+
+    def test_every_gate_captures_osascript_stderr(self):
+        # stderr=DEVNULL swallowed the AppleScript syntax error and let a
+        # broken dialog masquerade as a human Cancel.
+        for name, invoke in self.gate_calls():
+            with self.subTest(gate=name):
+                _script, kwargs = self.captured_dialog(invoke)
+                self.assertEqual(kwargs.get("stderr"), subprocess.PIPE)
+
+    def test_dialog_that_never_appeared_is_not_reported_as_cancel(self):
+        from ai_review.cli import CliInputError, _raise_user_presence_failure
+
+        syntax_error = subprocess.CompletedProcess(
+            ["/usr/bin/osascript"], 1, "",
+            "0:12: script error: Expected \"\\\"\" but found unknown token. (-2741)",
+        )
+        with self.assertRaises(CliInputError) as raised:
+            _raise_user_presence_failure(syntax_error)
+        self.assertIn("never appeared", str(raised.exception))
+        self.assertIn("-2741", str(raised.exception))
+
+    def test_real_cancel_and_silent_failure_still_report_cancelled(self):
+        from ai_review.cli import CliInputError, _raise_user_presence_failure
+
+        for stderr in ("45:52: execution error: User canceled. (-128)", "", None):
+            with self.subTest(stderr=stderr):
+                completed = subprocess.CompletedProcess(
+                    ["/usr/bin/osascript"], 1, "", stderr,
+                )
+                with self.assertRaises(CliInputError) as raised:
+                    _raise_user_presence_failure(completed)
+                self.assertEqual(str(raised.exception), "human approval was cancelled")
