@@ -46,7 +46,21 @@ EXIT_INTERRUPTED = 3
 # Plan repair must echo the whole revised Plan in one structured result, so the
 # bound scales with Plan size rather than with review latency; 300s truncated a
 # 62KB Plan repair mid-flight.
-EXTERNAL_CALL_TIMEOUT = 1800
+#
+# 2026-08-10, raised 1800 -> 3600 from measurement, not guesswork. A Review
+# repair on a 48-file / ~10k-line patch consumed the entire 1800s budget twice:
+# once with 29 preflight findings and again with only 8, so the bound is driven
+# by patch size, not by how much work was requested. The repair runs in safe
+# mode with a Bash-free tool set, so it cannot grep -- it must Read whole files,
+# and a single 2000-line ViewModel plus its spec and design doc already eat most
+# of half an hour before the first edit. Both runs ended PAUSED /
+# RUNNER_INTERRUPTED with the worktree half-written, which is the expensive
+# failure mode this bound is supposed to prevent.
+#
+# Deliberately not asserted in tests: this is a tuning knob, not an invariant,
+# and pinning the exact number would just make a legitimate future adjustment
+# show up as a red test.
+EXTERNAL_CALL_TIMEOUT = 3600
 _DIGEST = re.compile(r"^[0-9a-f]{64}$")
 _SECRET = re.compile(r"(?:sk-[A-Za-z0-9_-]{16,}|-----BEGIN [A-Z ]+-----|(?i:api[_-]?key|token|secret|password)\s*[:=]\s*[^\s]+)")
 _ROOT = Path(__file__).resolve().parent.parent
