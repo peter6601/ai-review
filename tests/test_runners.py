@@ -184,7 +184,16 @@ class RunnerTests(unittest.TestCase):
         execution = calls[-1]
         self.assertEqual(execution[0], "/usr/bin/sandbox-exec")
         profile = execution[execution.index("-p") + 1]
-        self.assertIn("(deny network*)", profile)
+        # Both directions of IP networking must be denied.
+        self.assertIn('(deny network-outbound (remote ip "*:*"))', profile)
+        self.assertIn('(deny network-inbound (local ip "*:*"))', profile)
+        # 🔴 MUST NOT use `(deny network*)` — it blocks unix domain sockets
+        # too, and on macOS the simulator's XCTest must talk to testmanagerd
+        # over a unix socket. With it, the build succeeds but tests never
+        # execute (exit 65), leaving the iOS profile's verification unusable.
+        # This assertion is the regression guard for that bug, not a style
+        # preference.
+        self.assertNotIn("(deny network*)", profile)
         self.assertIn("(deny file-write*", profile)
         self.assertIn(".git", profile)
         self.assertIn("common.git", profile)

@@ -18,8 +18,15 @@ from .process_security import executable_identity, resolve_executable, validate_
 
 
 VERIFICATION_POLICY = {
-    "version": 3,
-    "macos_sandbox": "deny-all-network-and-worktree-git-common-writes",
+    # v4 (2026-08-07): the macOS sandbox changed from "deny all network
+    # operations" to "deny both directions of IP networking, allow local unix
+    # domain sockets". See the profile comment in `runners.py` — the old value
+    # made every `xcodebuild test` on macOS unrunnable (testmanagerd speaks
+    # over a unix socket). This string is a behavior attestation signed into
+    # the manifest; when the behavior changes it must change with it, or the
+    # attestation is wrong.
+    "version": 4,
+    "macos_sandbox": "deny-ip-network-both-directions-allow-local-unix-sockets-and-deny-worktree-git-common-writes",
     "environment_keys": ["DEVELOPER_DIR", "HOME", "LANG", "LC_ALL", "PATH", "TMPDIR"],
     "path": "/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin",
 }

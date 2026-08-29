@@ -176,7 +176,34 @@ def run_verification(argv: Sequence[str], *, cwd: Path, timeout: Optional[float]
             '(deny file-write* (subpath %s))' % json.dumps(str(path))
             for path in sorted(denied)
         )
-        profile = "(version 1)(allow default)(deny network*)%s" % clauses
+        # Deny BOTH directions of IP networking, but do NOT block unix domain
+        # sockets.
+        #
+        # This used to be `(deny network*)`, and Seatbelt's `network*` blocks
+        # unix domain sockets too ⇒ no `xcodebuild test` can run on macOS: the
+        # simulator's XCTest must talk to testmanagerd over
+        # `/private/var/tmp/com.apple.launchd.*/com.apple.testmanagerd.unix-domain.socket`,
+        # and when that is blocked the build succeeds but the tests never
+        # execute, reporting only "Failed to establish communication with the
+        # test runner … Operation not permitted" (exit 65). ⇒ The entire iOS
+        # profile's verification was effectively unusable.
+        #
+        # A unix socket is local IPC and never leaves this machine, so the
+        # "deny network egress" intent is preserved. The only remaining
+        # indirect route is "proxy out through a local daemon" — but under
+        # `(allow default)` process spawning and mach-lookup are already wider
+        # channels, so the practical strength of this profile is unchanged.
+        #
+        # `network-bind` is deliberately not denied: with both directions
+        # denied a bare bind is not an exfiltration path, and denying it
+        # blocks the test runner's own local socket setup (measured: it falls
+        # back to the same failure).
+        profile = (
+            '(version 1)(allow default)'
+            '(deny network-outbound (remote ip "*:*"))'
+            '(deny network-inbound (local ip "*:*"))'
+            '%s' % clauses
+        )
         if not _already_restricted_by_seatbelt(denied):
             execution_argv = [str(sandbox), "-p", profile, *safe_argv]
     try:
