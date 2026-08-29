@@ -15,7 +15,7 @@
 ## 需求
 
 - **macOS**（驗證命令用 Seatbelt `sandbox-exec` 隔離，目前僅支援 macOS）
-- Python 3.13+，以及 `PyYAML`（`pip install pyyaml`）
+- Python 3.9+（macOS 內建版本即可），以及 `PyYAML`（`pip install pyyaml`）
 - `git`
 - [Claude Code CLI](https://claude.com/claude-code)（`claude`，需先在終端機登入過）
 - [Codex CLI](https://github.com/openai/codex)（`codex`，需登入）
@@ -69,7 +69,7 @@ ai-review status "RUN_ID"
 
 ## 安全模型（為什麼這麼囉唆）
 
-- **驗證命令白名單**：只接受 `xcodebuild` / `swift` / `pytest` / `unittest` / `cargo` / `go test` 等本地測試命令，且執行檔必須位於系統信任路徑；shell、wrapper、`git`、`curl` 一律拒絕。每個驗證命令都包在 Seatbelt 裡執行（禁網路、禁寫 Git 目錄）。
+- **驗證命令白名單**：只接受 `xcodebuild` / `swift` / `pytest` / `unittest` / `cargo` / `go test` 等本地測試命令，且執行檔必須位於系統信任路徑；shell、wrapper、`git`、`curl` 一律拒絕。每個驗證命令都包在 Seatbelt 裡執行（禁 IP 網路雙向、禁寫 Git 目錄；本機 unix domain socket 放行——否則 macOS 上 `xcodebuild test` 無法與 testmanagerd 通訊，測試永遠不會執行）。
 - **人類 gate 用簽章綁定**：`approve-plan` / `approve-review` / `approve-risk` / `approve-code` 顯示原生 macOS 對話框，簽章綁定當下的 patch digest 與 base OID；worktree 之後有任何變動，核准即失效。
 - **修復回合上限**：最多六回合，到頂就停給人看，開新 run 不能重置計數。
 - **AI 產物有界**：status 只回摘要，不吐 log / prompt / patch / transcript；second-brain 來源是 checksum 綁定的證據，不是可執行指令。

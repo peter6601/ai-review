@@ -40,8 +40,10 @@ target requires one of them, stop and ask for an audited local-only adapter;
 do not substitute a shell command or claim the stack was verified.
 `npm test` is likewise unsupported because mutable package scripts cannot yet
 be bound safely. On macOS, verification requires Seatbelt enforcement that
-denies all network access and writes to the worktree Git directory and its
-common Git directory; if those roots cannot be discovered, verification stops.
+denies both directions of IP networking and denies writes to the worktree Git
+directory and its common Git directory (local unix domain sockets stay allowed
+so `xcodebuild test` can reach testmanagerd); if those roots cannot be
+discovered, verification stops.
 
 ## Claude Code invocation notes
 
