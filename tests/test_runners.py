@@ -222,7 +222,7 @@ class RunnerTests(unittest.TestCase):
             "findings": [{
                 "id": "F-1", "severity": "major", "invariant": "safe",
                 "location": "x.py:1", "evidence": "bad", "required_outcome": "fix",
-                "lineage": {"resolution": "fixed"},
+                "lineage": {"resolution": "existing"},
             }],
         }
         self.assertEqual(validate_codex_review(valid), valid)
@@ -235,9 +235,70 @@ class RunnerTests(unittest.TestCase):
         missing_nested = dict(valid, findings=[dict(valid["findings"][0], lineage={})])
         with self.assertRaises(ValueError):
             validate_codex_review(missing_nested)
-        additional_nested = dict(valid, findings=[dict(valid["findings"][0], lineage={"resolution": "fixed", "extra": "no"})])
+        additional_nested = dict(valid, findings=[dict(valid["findings"][0], lineage={"resolution": "existing", "extra": "no"})])
         with self.assertRaises(ValueError):
             validate_codex_review(additional_nested)
+
+    def test_codex_lineage_is_a_typed_contract(self):
+        def with_lineage(lineage):
+            return {
+                "verdict": "CHANGES_REQUIRED", "summary": "fix this",
+                "questions": [], "context_requests": [],
+                "findings": [{
+                    "id": "F-1", "severity": "major", "invariant": "safe",
+                    "location": "x.py:1", "evidence": "bad", "required_outcome": "fix",
+                    "lineage": lineage,
+                }],
+            }
+
+        # Free-text resolutions were the old contract; the enum replaces them.
+        with self.assertRaises(ValueError):
+            validate_codex_review(with_lineage({"resolution": "fixed"}))
+        # newly_discovered requires a non-empty discovery_reason.
+        with self.assertRaises(ValueError):
+            validate_codex_review(with_lineage({"resolution": "newly_discovered"}))
+        with self.assertRaises(ValueError):
+            validate_codex_review(with_lineage(
+                {"resolution": "newly_discovered", "discovery_reason": "  "}
+            ))
+        accepted = with_lineage(
+            {"resolution": "newly_discovered", "discovery_reason": "only reachable after the round-2 repair exposed the call path"}
+        )
+        self.assertEqual(validate_codex_review(accepted), accepted)
+        # discovery_reason may accompany other resolutions but must be non-empty.
+        with self.assertRaises(ValueError):
+            validate_codex_review(with_lineage({"resolution": "existing", "discovery_reason": ""}))
+
+    def test_a_null_discovery_reason_means_the_same_as_no_discovery_reason(self):
+        """Structured output cannot omit a property, so it sends null instead.
+
+        Every property of an output schema must be listed as required, which
+        leaves nullability as the only way to say optional.  Codex therefore
+        always sends the key; null is how it says there is nothing to say, and
+        the two spellings must not reach opposite verdicts.
+        """
+        def with_lineage(lineage):
+            return {
+                "verdict": "CHANGES_REQUIRED", "summary": "fix this",
+                "questions": [], "context_requests": [],
+                "findings": [{
+                    "id": "F-1", "severity": "major", "invariant": "safe",
+                    "location": "x.py:1", "evidence": "bad", "required_outcome": "fix",
+                    "lineage": lineage,
+                }],
+            }
+
+        # Null is dropped, so an existing finding stays valid and carries no reason.
+        accepted = validate_codex_review(
+            with_lineage({"resolution": "existing", "discovery_reason": None})
+        )
+        self.assertNotIn("discovery_reason", accepted["findings"][0]["lineage"])
+        # And the rule that a newly discovered finding must explain itself still
+        # bites, rather than being satisfied by a key that says nothing.
+        with self.assertRaises(ValueError):
+            validate_codex_review(
+                with_lineage({"resolution": "newly_discovered", "discovery_reason": None})
+            )
 
     def test_schema_semantics_require_claude_resolutions_for_findings(self):
         resolution = {"summary": "done", "resolutions": []}

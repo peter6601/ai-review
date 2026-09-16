@@ -272,7 +272,9 @@ class CodeWorkflowTests(unittest.TestCase):
         self.assertEqual(len(evidence[0]["relevant_output"].splitlines()), 200)
         self.assertNotIn("stdout_path", evidence[0])
         self.assertNotIn("stderr_path", evidence[0])
-        self.assertNotIn("verification/", codex.calls[0]["patch"])
+        # The reviewer is pointed at the frozen patch, so the artifact it will
+        # open is what must be free of the run store's own verification logs.
+        self.assertNotIn(b"verification/", Path(codex.calls[0]["patch_path"]).read_bytes())
         self.assertFalse((self.repo / ".ai-review").exists())
 
     def test_store_rejects_artifacts_inside_target_repository(self):
@@ -444,7 +446,14 @@ class CodeWorkflowTests(unittest.TestCase):
         repaired = (self.artifacts / "patches" / "round-0001.patch").read_bytes()
         self.assertNotIn(b"NewProduction.swift", initial)
         self.assertIn(b"NewProduction.swift", repaired)
-        self.assertIn("NewProduction.swift", codex.calls[-1]["patch"])
+        # The re-review must be pointed at the recaptured patch, not the frozen one.
+        self.assertEqual(
+            codex.calls[-1]["patch_path"],
+            str((self.artifacts / "patches" / "round-0001.patch").resolve()),
+        )
+        self.assertEqual(
+            codex.calls[-1]["patch_sha256"], hashlib.sha256(repaired).hexdigest()
+        )
 
     def test_resume_replays_a_journaled_repair_without_recalling_claude(self):
         codex = FakeCodex([review("CHANGES_REQUIRED", findings=[blocker("F-1")])])

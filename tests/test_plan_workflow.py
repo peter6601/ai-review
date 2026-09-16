@@ -614,6 +614,24 @@ class PlanWorkflowTests(unittest.TestCase):
         self.assertEqual(json.loads((self.artifacts / "pause.json").read_text())["reason"], "REVIEW_GATE_MOVED")
         self.assertEqual(len(claude.calls), 1)
 
+    def test_newly_discovered_lineage_with_reason_does_not_move_the_gate(self):
+        late = finding("F-2")
+        late["lineage"] = {
+            "resolution": "newly_discovered",
+            "discovery_reason": "the first repair exposed the missing rollback section",
+        }
+        codex = FakeCodex([
+            review("CHANGES_REQUIRED", findings=[finding("F-1")]),
+            review("CHANGES_REQUIRED", findings=[late]),
+            review("PASS"),
+        ])
+        claude = FakeClaude([resolution("F-1"), resolution("F-2")])
+
+        result = self.workflow(codex, claude).run(self.run.run_id)
+
+        self.assertEqual(result.status, Status.AWAITING_HUMAN_PLAN_REVIEW)
+        self.assertEqual(len(claude.calls), 2)
+
     def test_reviewer_receives_only_the_allowed_inputs_and_raw_output_is_saved_first(self):
         codex = FakeCodex([review("PASS")])
         result = self.workflow(codex, FakeClaude()).run(self.run.run_id)

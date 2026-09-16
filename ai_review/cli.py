@@ -36,6 +36,14 @@ from .process_security import (
     controlled_env, executable_identity, resolve_executable, run_git,
     validate_executable_identity,
 )
+from .auto_approval import (
+    AgentApprovalProvider,
+    AutoApprovalRateLimited,
+    MAX_AUTO_APPROVALS,
+    WINDOW_SECONDS,
+    ledger_path,
+    reserve as reserve_auto_approval,
+)
 from .preflight import PreflightError, load_preflight_text
 from .review_workflow import DirectReviewWorkflow
 from .workflow import CodeWorkflow, PlanWorkflow
@@ -43,6 +51,7 @@ from .workflow import CodeWorkflow, PlanWorkflow
 
 EXIT_INVALID = 2
 EXIT_INTERRUPTED = 3
+EXIT_RATE_LIMITED = 4
 # Plan repair must echo the whole revised Plan in one structured result, so the
 # bound scales with Plan size rather than with review latency; 300s truncated a
 # 62KB Plan repair mid-flight.
@@ -132,6 +141,17 @@ def _parser() -> argparse.ArgumentParser:
     review_approval.add_argument("run_id")
     risk_approval = commands.add_parser("approve-risk")
     risk_approval.add_argument("run_id")
+    # Review's two in-loop gates, and only those, may be cleared by the calling
+    # agent instead of by a person.  approve-code is deliberately absent: the
+    # terminal gate is where a person reads the diff, whether the loop ended in
+    # a Codex PASS or ran out of repair rounds.  The flag is explicit at every
+    # call site so the choice is visible in the transcript, never inherited
+    # from the environment or from configuration.
+    for gate in (review_approval, risk_approval):
+        gate.add_argument(
+            "--auto", action="store_true",
+            help="approve as the agent, under the auto-approval rate limit",
+        )
     preflight = commands.add_parser("submit-preflight")
     preflight.add_argument("run_id")
     preflight.add_argument("--findings", required=True)
@@ -636,6 +656,21 @@ def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _review_gate_provider(
+    args: argparse.Namespace, store: RunStore, *, run_id: str, command: str
+) -> Any:
+    """Choose the human dialog, or spend one slot of the agent's rate limit.
+
+    The slot is consumed at the moment of approval, after every binding has
+    already been validated, so a rejected request never costs the caller a
+    slot and a granted slot always corresponds to a signed receipt.
+    """
+    if not getattr(args, "auto", False):
+        return MacOSHumanApprovalProvider()
+    reserve_auto_approval(ledger_path(store.root), run_id=run_id, command=command)
+    return AgentApprovalProvider()
+
+
 def _init_plan(args: argparse.Namespace, store: RunStore) -> RunState:
     repo = _resolve_repo(args.repo)
     plan = _resolve_plan(repo, args.plan)
@@ -798,7 +833,10 @@ def _approve_review(args: argparse.Namespace, store: RunStore) -> RunState:
         raise CliInputError("approve-review requires Review awaiting approval")
     manifest = state.manifest
     _validate_review_approval_inputs(store, state)
-    receipt = MacOSHumanApprovalProvider().approve_review(
+    provider = _review_gate_provider(
+        args, store, run_id=state.run_id, command="approve-review"
+    )
+    receipt = provider.approve_review(
         run_id=state.run_id, manifest_digest=manifest.digest(), brief=manifest.brief,
         base_oid=manifest.base_oid, initial_patch_digest=manifest.initial_patch_digest,
         verification_commands=[command.to_dict() for command in manifest.verification_commands],
@@ -878,7 +916,10 @@ def _approve_risk(args: argparse.Namespace, store: RunStore) -> RunState:
         raise CliInputError("recorded high-risk patch does not match its request")
     if not hmac.compare_digest(hashlib.sha256(current).hexdigest(), patch_digest):
         raise CliInputError("current patch does not match the high-risk patch under review")
-    receipt = MacOSHumanApprovalProvider().approve_risk(
+    provider = _review_gate_provider(
+        args, store, run_id=state.run_id, command="approve-risk"
+    )
+    receipt = provider.approve_risk(
         run_id=state.run_id, manifest_digest=state.manifest.digest(),
         patch_digest=patch_digest, categories=[str(item) for item in categories],
         paths=sorted({
@@ -1041,6 +1082,8 @@ def _approve_code(args: argparse.Namespace, store: RunStore) -> RunState:
     ):
         raise CliInputError("approve-code requires reviewed Code awaiting human review")
     candidate, digest = _reviewed_code_candidate(store, state)
+    # The terminal gate has exactly one approval mechanism.  Review's --auto
+    # stops at the loop's edge: a person reads this diff.
     presence = MacOSHumanApprovalProvider().approve_code(
         run_id=state.run_id, candidate_digest=digest
     )
@@ -1219,6 +1262,12 @@ def main(
     except KeyboardInterrupt:
         sys.stderr.write("ai-review: interrupted external execution\n")
         return EXIT_INTERRUPTED
+    except AutoApprovalRateLimited as error:
+        sys.stderr.write(
+            "ai-review: %s (limit %d per %ds)\n"
+            % (_safe_error(error), MAX_AUTO_APPROVALS, int(WINDOW_SECONDS))
+        )
+        return EXIT_RATE_LIMITED
     except (CliInputError, ValueError, OSError, RunnerError) as error:
         sys.stderr.write("ai-review: %s\n" % _safe_error(error))
         return EXIT_INVALID

@@ -451,13 +451,16 @@ class DirectReviewWorkflow(CodeWorkflow):
     def _review_input(self, state: RunState, artifacts: Path, verification: list[dict]) -> dict:
         # The same allowlist discipline as Code mode, with the brief replacing the
         # approved Plan: no repository sweep, credentials, or model chatter.
+        pointer = self._latest_patch_pointer(artifacts)
         return {
             "review_brief": state.manifest.brief,
             "review_manifest_digest": state.manifest.digest(),
             "profile": state.manifest.profile,
             "repo": state.manifest.repo_path,
             "base_oid": state.manifest.base_oid,
-            "patch": self._latest_patch(artifacts),
+            "patch_path": pointer["path"],
+            "patch_sha256": pointer["sha256"],
+            "patch_bytes": pointer["bytes"],
             "patch_stats": self._latest_stats(artifacts),
             "verification": self._prompt_verification(verification),
             "context_manifest": self._context_manifest(artifacts),

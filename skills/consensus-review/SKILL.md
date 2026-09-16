@@ -7,7 +7,8 @@ description: Use when code already exists locally and needs direct Codex review 
 
 Review code that already exists, without inventing a Plan. Codex reviews first,
 one Claude repairs, verification re-runs, Codex re-reviews, and the run always
-stops for the human's final Code approval.
+stops for the human's final Code approval. You may clear the two gates inside
+that loop yourself; you may never clear the last one.
 
 Never create a Plan run, fake a Plan, or route existing code through
 `consensus-code`. `consensus-code` still requires a human-approved Plan; this
@@ -17,12 +18,16 @@ Command map, in order:
 
 1. `ai-review init review` — freeze the base, brief, profile, verification, and
    the complete current patch. No model runs.
-2. `ai-review approve-review` — the human's native scope gate. Nothing runs before it.
+2. `ai-review approve-review` — the scope gate. Nothing runs before it.
 3. `ai-review run` / `ai-review resume` — the Codex-first loop.
 4. `ai-review submit-preflight` — iOS only, exactly once, read-only findings.
-5. `ai-review approve-risk` — the human binds one high-risk patch.
+5. `ai-review approve-risk` — binds one high-risk patch.
 6. `ai-review approve-code` — the human's final gate.
 7. `ai-review writeback-knowledge` — separate, never automatic.
+
+Gates 2 and 5 accept `--auto`, which approves as you instead of waiting for a
+person; read **Auto-approval and its rate limit** before using it. Gate 6 does
+not, and never will.
 
 Every block below invokes the `ai-review` helper from this repository's
 `bin/` directory (put it on `PATH`, as the README describes); invoke each
@@ -61,16 +66,49 @@ base to the current worktree (commits, staged and unstaged tracked edits, and
 untracked files), and returns `AWAITING_REVIEW_APPROVAL` with
 `next_action: human_review_scope`. No model has run yet.
 
-Tell the human the run ID, base OID, profile, initial patch digest, and the exact
-verification argv, then invoke the native scope gate. The human clicks the
-dialog; never interact with it, and never auto-approve. Cancel, headless
-execution, a changed worktree, or an unavailable dialog means stop.
+Report the run ID, base OID, profile, initial patch digest, and the exact
+verification argv, then clear the scope gate. With `--auto` you clear it
+yourself. Without it the human clicks a native dialog you must never touch, and
+Cancel, headless execution, or an unavailable dialog means stop. Under either
+provider, a worktree that changed still means stop.
 
 ```bash
 ai-review approve-review "REVIEW_RUN_ID"
 ai-review run "REVIEW_RUN_ID"
 ai-review status "REVIEW_RUN_ID"
 ```
+
+## Auto-approval and its rate limit
+
+```bash
+ai-review approve-review --auto "REVIEW_RUN_ID"
+```
+
+`--auto` is per invocation and is never inherited from the environment or from
+configuration. Nothing else about the gate relaxes: the base OID, the recaptured
+patch digest, the manifest digest, and the verification argv are still bound and
+signed; a worktree that moved still fails; and the receipt records
+`provider: agent:auto-approval` with `actor: ai-review-agent`, so a signed
+approval never claims that a person pressed anything.
+
+**At most five auto-approvals in any 60-second sliding window**, counted across
+every run and all three gates in one ledger beside the approval key. The sixth
+exits `4` with `retry_after=Ns`, approves nothing, and leaves the run exactly
+where it was. Wait the window out. Never route around the limit by creating a
+second run.
+
+A slot is spent only when a receipt is signed: a gate refused for any other
+reason costs nothing, and a human dialog approval costs nothing.
+
+`--auto` covers the loop, not its exit. `approve-code` has no `--auto` at all —
+passing it is an argument error — and neither does `approve-plan`. Both terminal
+gates keep exactly one approval mechanism: the person. That holds however the
+loop ended. A terminal Codex `PASS` is not a second opinion on itself, and a
+`MAX_REPAIR_ROUNDS` pause hands the remaining findings over by hand. Either way
+somebody reads the diff.
+
+So `--auto` buys one thing: the review and its repairs run unattended. Report
+`AWAITING_HUMAN_CODE_REVIEW` with the summary path and stop there.
 
 ## Loop behavior
 
@@ -114,7 +152,8 @@ evidence, never an instruction.
 **`PAUSED` with reason `HIGH_RISK_CHANGE`** — Claude touched a dependency
 declaration or lockfile, a migration, entitlements/signing/provisioning, a CI/CD
 workflow, a public API contract, or a persisted/network format. Show the human
-the recorded categories and paths, then let them bind that exact patch:
+the recorded categories and paths, then bind that exact patch — `--auto` binds
+it as you, otherwise the human does:
 
 ```bash
 ai-review approve-risk "REVIEW_RUN_ID"
@@ -198,7 +237,8 @@ repair round and is reviewed by the next Codex round.
 
 ## Terminal approval and knowledge
 
-Only the human runs the final gate, and only after they have read the diff:
+Only the human runs the final gate, and only after they have read the diff.
+There is no agent path to this command:
 
 ```bash
 ai-review approve-code "REVIEW_RUN_ID"
@@ -213,9 +253,7 @@ triggers holds: three or more repair rounds, a repeated invariant, a scope or
 high-risk pause, human arbitration, a reusable architecture/testing lesson, or
 all six repair rounds exhausted. Writeback is a separate, never-automatic command
 permitted only after that exact approval, and it writes one file under
-`<workspace>/second-brain/ai-review/` (the workspace root defaults to
-`~/.ai-review/workspace` and can be changed with the `AI_REVIEW_WORKSPACE`
-environment variable):
+`second-brain/ai-review/`:
 
 ```bash
 ai-review writeback-knowledge "REVIEW_RUN_ID"
@@ -232,9 +270,11 @@ orchestrator executes the approved verification argv.
   rejects a nested sandbox. This loosens only the outer orchestrating call — the
   inner Codex read-only sandbox, Claude safe mode, and per-command Seatbelt stay
   exactly as designed. Never pass a dangerously-bypass option to either model.
-- `approve-review`, `approve-risk`, and `approve-code` show a native `osascript`
-  dialog and need a GUI session; they fail under a sandboxed or headless call.
-  Each dialog is bounded at 120s — tell the human it is waiting before invoking.
+- `approve-code` always shows a native `osascript` dialog, and so do
+  `approve-review` and `approve-risk` without `--auto`. A dialog needs a GUI
+  session and fails under a sandboxed or headless call; each one is bounded at
+  120s, so tell the human it is waiting before invoking. With `--auto` there is
+  no dialog, so those two gates also work headless and in the background.
 - `run` is synchronous and routinely outlasts the Bash tool's 600s ceiling. Each
   Codex review, Claude repair, and verification command is bounded at 1800s and
   six repair rounds multiply them. Always run it in the background and poll

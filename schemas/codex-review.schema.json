@@ -24,8 +24,11 @@
           "lineage": {
             "type": "object",
             "additionalProperties": false,
-            "required": ["resolution"],
-            "properties": {"resolution": {"type": "string", "minLength": 1}}
+            "required": ["resolution", "discovery_reason"],
+            "properties": {
+              "resolution": {"type": "string", "enum": ["existing", "introduced_by_fix", "newly_discovered", "deferred"]},
+              "discovery_reason": {"type": ["string", "null"]}
+            }
           }
         }
       }

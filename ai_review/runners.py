@@ -257,13 +257,29 @@ def validate_codex_review(payload: Any) -> Mapping[str, Any]:
         if item["severity"] not in {"blocker", "major", "minor", "info"}:
             raise ValueError("finding severity must be a declared enum value")
         lineage = item["lineage"]
+        # A structured-output schema must mark every property required, so an
+        # optional field can only be expressed as a nullable one.  Codex
+        # therefore always sends `discovery_reason`, and sends it as null when
+        # there is none: absent and null have to mean the same thing here, or
+        # the rule below would accept a newly discovered finding that explains
+        # nothing.
+        if isinstance(lineage, dict) and lineage.get("discovery_reason") is None:
+            lineage.pop("discovery_reason", None)
         if (
             not isinstance(lineage, dict)
-            or set(lineage) != {"resolution"}
+            or "resolution" not in lineage
+            or not set(lineage) <= {"resolution", "discovery_reason"}
             or not isinstance(lineage["resolution"], str)
-            or not lineage["resolution"]
         ):
-            raise ValueError("finding lineage must contain only resolution")
+            raise ValueError("finding lineage must contain resolution and at most discovery_reason")
+        if lineage["resolution"] not in {"existing", "introduced_by_fix", "newly_discovered", "deferred"}:
+            raise ValueError("finding lineage resolution must be a declared enum value")
+        if "discovery_reason" in lineage and (
+            not isinstance(lineage["discovery_reason"], str) or not lineage["discovery_reason"].strip()
+        ):
+            raise ValueError("finding lineage discovery_reason must be non-empty")
+        if lineage["resolution"] == "newly_discovered" and "discovery_reason" not in lineage:
+            raise ValueError("newly_discovered findings require a discovery_reason")
         blocker = blocker or item["severity"] == "blocker"
         if item["severity"] == "blocker" and lineage["resolution"] == "deferred":
             raise ValueError("blocker findings cannot be deferred")

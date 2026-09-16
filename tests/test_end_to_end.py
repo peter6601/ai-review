@@ -306,7 +306,7 @@ class EndToEndWorkflowTests(_ExternalHarness, unittest.TestCase):
             targets.extend((InstallTarget(source, claude_root / name), InstallTarget(source, codex_root / name)))
         apply_install(targets, self.root / "temporary-backups", [claude_root, codex_root], canonical_root=source_root)
         self.assertEqual(len(targets), 2 * len(SKILL_NAMES))
-        self.assertEqual(len(targets), 6)
+        self.assertEqual(len(targets), 8)
         self.assertIn("consensus-review", SKILL_NAMES)
         self.assertEqual([target.target.resolve() for target in targets], [target.source.resolve() for target in targets])
 

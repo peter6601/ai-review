@@ -1242,7 +1242,7 @@ class UserPresenceDialogRegressionTests(unittest.TestCase):
 
     def test_every_gate_captures_osascript_stderr(self):
         # stderr=DEVNULL swallowed the AppleScript syntax error and let a
-        # broken dialog masquerade as a human Cancel.
+        # broken dialog masquerade as a human Cancel for three sessions.
         for name, invoke in self.gate_calls():
             with self.subTest(gate=name):
                 _script, kwargs = self.captured_dialog(invoke)

@@ -233,8 +233,15 @@ class GenericDirectReviewTests(ReviewWorkflowTestCase):
         self.assertEqual(
             inputs["review_manifest_digest"], self.run.manifest.digest()
         )
-        self.assertIn("Feature.py", inputs["patch"])
-        self.assertIn("tests/test_retry.py", inputs["patch"])
+        # Codex is pointed at the frozen patch rather than handed its bytes, so
+        # the contract to test is that the pointer resolves, proves itself
+        # against the digest that travels with it, and holds the whole change.
+        reviewed = Path(inputs["patch_path"]).read_bytes()
+        self.assertEqual(hashlib.sha256(reviewed).hexdigest(), inputs["patch_sha256"])
+        self.assertEqual(len(reviewed), inputs["patch_bytes"])
+        self.assertIn(b"Feature.py", reviewed)
+        self.assertIn(b"tests/test_retry.py", reviewed)
+        self.assertNotIn("patch", inputs)
         for forbidden in ("approved_plan", "approved_plan_digest", "approved_manifest_digest"):
             self.assertNotIn(forbidden, inputs)
 
@@ -266,7 +273,13 @@ class GenericDirectReviewTests(ReviewWorkflowTestCase):
         self.assertEqual(len(calls), 2)
         repaired = (self.artifacts / "patches" / "round-0001.patch").read_bytes()
         self.assertIn(b"Retry.py", repaired)
-        self.assertIn("Retry.py", codex.calls[1]["patch"])
+        # The re-review must be pointed at the recaptured patch, not the one
+        # frozen before the repair.
+        self.assertEqual(
+            codex.calls[1]["patch_path"],
+            str((self.artifacts / "patches" / "round-0001.patch").resolve()),
+        )
+        self.assertIn(b"Retry.py", Path(codex.calls[1]["patch_path"]).read_bytes())
 
     def test_repair_input_uses_the_review_brief_and_never_a_plan(self):
         codex = FakeCodex([
@@ -561,6 +574,45 @@ class GenericDirectReviewTests(ReviewWorkflowTestCase):
             "MAX_REPAIR_ROUNDS",
         )
         self.assertEqual(len(claude.repair_calls), 6)
+
+    def test_new_later_finding_without_typed_lineage_pauses_gate_moved(self):
+        codex = FakeCodex([
+            review("CHANGES_REQUIRED", findings=[blocker("CODE-001")]),
+            review("CHANGES_REQUIRED", findings=[blocker("CODE-002")]),
+        ])
+        claude = FakeClaude(repairs=[repair_result("CODE-001")])
+
+        result = self.workflow(codex=codex, claude=claude, verification=self.green).run(
+            self.run.run_id
+        )
+
+        self.assertEqual(result.status, Status.PAUSED)
+        self.assertEqual(
+            json.loads((self.artifacts / "pause.json").read_text())["reason"],
+            "REVIEW_GATE_MOVED",
+        )
+        self.assertEqual(len(claude.repair_calls), 1)
+
+    def test_newly_discovered_lineage_with_reason_does_not_move_the_gate(self):
+        late = blocker("CODE-002")
+        late["lineage"] = {
+            "resolution": "newly_discovered",
+            "discovery_reason": "the first repair exposed the failing call path",
+        }
+        codex = FakeCodex([
+            review("CHANGES_REQUIRED", findings=[blocker("CODE-001")]),
+            review("CHANGES_REQUIRED", findings=[late]),
+            review("PASS"),
+        ])
+        claude = FakeClaude(repairs=[repair_result("CODE-001"), repair_result("CODE-002")])
+
+        result = self.workflow(codex=codex, claude=claude, verification=self.green).run(
+            self.run.run_id
+        )
+
+        self.assertEqual(result.status, Status.AWAITING_HUMAN_CODE_REVIEW)
+        self.assertEqual(result.repair_round, 2)
+        self.assertEqual(len(claude.repair_calls), 2)
 
 
 class HighRiskDetectionTests(ReviewWorkflowTestCase):
@@ -1285,7 +1337,10 @@ class ReviewScopeIntegrityTests(ReviewWorkflowTestCase):
             hashlib.sha256(captured).hexdigest(),
             self.run.manifest.initial_patch_digest,
         )
-        self.assertIn("Feature.py", codex.calls[0]["patch"])
+        self.assertEqual(
+            codex.calls[0]["patch_sha256"], self.run.manifest.initial_patch_digest
+        )
+        self.assertIn(b"Feature.py", Path(codex.calls[0]["patch_path"]).read_bytes())
 
     def test_a_claude_reported_risk_category_pauses_a_generic_run(self):
         """Claude's disclosure must reach the detector, not just free text."""

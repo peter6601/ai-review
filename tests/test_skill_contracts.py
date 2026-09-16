@@ -30,6 +30,25 @@ class SkillContractTests(unittest.TestCase):
         ):
             self.assertIn(phrase, text)
 
+    def test_agent_auto_approval_is_documented_with_its_limit_and_its_cost(self):
+        """`--auto` weakens a human gate, so the skill must say exactly how much."""
+        _, text = skill("consensus-review")
+
+        for phrase in (
+            "--auto",
+            "five auto-approvals in any 60-second sliding window",
+            "agent:auto-approval",
+            "Never route around the limit by creating a\nsecond run.",
+        ):
+            self.assertIn(phrase, text)
+        # The loop may run unattended; its exit may not.
+        self.assertIn("`approve-code` has no `--auto` at all", text)
+        self.assertIn(
+            "Only the human runs the final gate, and only after they have read "
+            "the diff.", text,
+        )
+        self.assertNotIn("approve-code --auto", text)
+
     def test_the_six_repair_ceiling_cannot_be_reset_by_a_fresh_run(self):
         """Regression: the generic PAUSED restart advice also covered MAX_REPAIR_ROUNDS."""
         _, text = skill("consensus-review")

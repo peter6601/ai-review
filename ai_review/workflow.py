@@ -339,7 +339,7 @@ class PlanWorkflow:
         self, state: RunState, artifacts: Path, sequence: int, review: Mapping[str, Any], action: Path
     ) -> None:
         if self._moves_review_gate(state, artifacts, review["findings"]):
-            self._pause(state, artifacts, "REVIEW_GATE_MOVED", "new later finding lacks fix lineage")
+            self._pause(state, artifacts, "REVIEW_GATE_MOVED", "new later finding lacks introduced_by_fix or newly_discovered lineage")
             return
         required_ids = [item["id"] for item in review["findings"]]
         if not required_ids:
@@ -691,16 +691,20 @@ class PlanWorkflow:
         }
 
     def _moves_review_gate(self, state: RunState, artifacts: Path, findings: Iterable[Mapping[str, Any]]) -> bool:
+        # Anti-ratchet: after round 0 the finding set may only carry over, or
+        # grow with a typed lineage — introduced_by_fix, or newly_discovered
+        # with a stated discovery reason. The reviewer prompt states this
+        # contract; an unseen ID claiming any other lineage moves the gate.
         if state.repair_round < 1:
             return False
         seen = set(self._read_json(artifacts / "seen-findings.json", {"ids": []})["ids"])
         for item in findings:
             if item["id"] in seen:
                 continue
-            if item["lineage"]["resolution"] == "introduced_by_fix":
+            lineage = item["lineage"]
+            if lineage["resolution"] == "introduced_by_fix":
                 continue
-            evidence = item["evidence"].strip().lower()
-            if "earlier" in evidence and ("because" in evidence or "discoverable" in evidence):
+            if lineage["resolution"] == "newly_discovered" and lineage.get("discovery_reason"):
                 continue
             return True
         return False
@@ -1174,7 +1178,7 @@ class CodeWorkflow(PlanWorkflow):
     ) -> None:
         findings = review["findings"]
         if findings and self._moves_review_gate(state, artifacts, findings):
-            self._pause(state, artifacts, "REVIEW_GATE_MOVED", "new later finding lacks fix lineage")
+            self._pause(state, artifacts, "REVIEW_GATE_MOVED", "new later finding lacks introduced_by_fix or newly_discovered lineage")
             return
         if state.repair_round >= self.policy.max_rounds:
             self._pause(state, artifacts, "MAX_REPAIR_ROUNDS", "a seventh Claude repair must not start")
@@ -1421,11 +1425,13 @@ class CodeWorkflow(PlanWorkflow):
 
     def _code_review_input(self, state: RunState, artifacts: Path, verification: list[dict]) -> dict:
         plan = self._plan_text(state)
+        pointer = self._latest_patch_pointer(artifacts)
         return {
             "approved_plan": plan, "approved_plan_digest": hashlib.sha256(plan.encode("utf-8")).hexdigest(),
             "approved_manifest_digest": state.manifest.digest(),
             "repo": state.manifest.repo_path, "base_oid": state.manifest.base_oid,
-            "patch": self._latest_patch(artifacts), "patch_stats": self._latest_stats(artifacts),
+            "patch_path": pointer["path"], "patch_sha256": pointer["sha256"],
+            "patch_bytes": pointer["bytes"], "patch_stats": self._latest_stats(artifacts),
             "verification": self._prompt_verification(verification), "context_manifest": self._context_manifest(artifacts),
             "knowledge_packet": self._knowledge_packet(artifacts), "unresolved_prior_findings": self._unresolved_findings(artifacts),
             "user_decisions": self._user_decisions(artifacts),
@@ -1455,11 +1461,30 @@ class CodeWorkflow(PlanWorkflow):
                 })
         return decisions
 
-    def _latest_patch(self, artifacts: Path) -> str:
+    def _latest_patch_pointer(self, artifacts: Path) -> dict:
+        """Where the frozen patch is, rather than the patch itself.
+
+        Codex already runs inside the repository with read-only tools, so it can
+        open the patch the way a person would: in whatever pieces it needs, and
+        skipping what it cannot read.  Inlining the bytes made the prompt a
+        single argv item as large as the patch, so a branch carrying a few
+        megabytes of artwork could not be reviewed at all — ``exec`` failed with
+        ``E2BIG`` before Codex ever started, and the only symptom was that
+        external review "could not start".
+
+        The digest travels with the path because a pointer is only as good as
+        the reader's ability to prove what it points at.  Inlined bytes had to be
+        taken on trust; a file plus its digest can be checked.
+        """
         patches = self.store.list_artifacts(artifacts / "patches", ".patch")
         if not patches:
-            return ""
-        return self.store.read_artifact_bytes(patches[-1]).decode("utf-8", "replace")
+            return {"path": "", "sha256": "", "bytes": 0}
+        content = self.store.read_artifact_bytes(patches[-1])
+        return {
+            "path": str(Path(patches[-1]).resolve()),
+            "sha256": hashlib.sha256(content).hexdigest(),
+            "bytes": len(content),
+        }
 
     def _latest_stats(self, artifacts: Path) -> dict:
         stats = self.store.list_artifacts(artifacts / "patch-stats", ".json")
