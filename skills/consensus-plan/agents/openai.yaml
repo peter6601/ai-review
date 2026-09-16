@@ -1,4 +1,4 @@
 interface:
-  display_name: "Consensus Plan"
-  short_description: "Human-gated Plan consensus workflow"
-  default_prompt: "Use $consensus-plan to review this approved requirement before implementation."
+  display_name: "Consensus Doc Review"
+  short_description: "Read-only Codex review of one repository document"
+  default_prompt: "Use $consensus-plan to review this document read-only with Codex; report the findings, and never edit the document."

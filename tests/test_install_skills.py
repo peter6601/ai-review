@@ -10,7 +10,6 @@ from install_skills import SKILL_NAMES, InstallTarget, apply_install, check_inst
 
 EXPECTED_SKILL_NAMES = (
     "consensus-plan",
-    "consensus-code",
     "consensus-review",
 )
 
@@ -19,7 +18,7 @@ class InstallSkillsTests(unittest.TestCase):
     def test_canonical_skill_names_cover_both_consensus_entry_points(self):
         self.assertEqual(SKILL_NAMES, EXPECTED_SKILL_NAMES)
 
-    def test_temporary_source_root_check_is_read_only_and_apply_links_all_six_targets(self):
+    def test_temporary_source_root_check_is_read_only_and_apply_links_all_four_targets(self):
         """Catch an installer that depends on a feature worktree or touches a real home."""
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
@@ -34,7 +33,7 @@ class InstallSkillsTests(unittest.TestCase):
                 (source / "SKILL.md").write_text(name, encoding="utf-8")
                 sources.append(source)
                 targets.extend((InstallTarget(source, claude_root / name), InstallTarget(source, codex_root / name)))
-            self.assertEqual(len(targets), 6)
+            self.assertEqual(len(targets), 4)
             before = sorted(str(path.relative_to(root)) for path in root.rglob("*"))
             output = io.StringIO()
             with patch("install_skills.Path.home", return_value=root / "unused-home"), patch(
@@ -42,10 +41,10 @@ class InstallSkillsTests(unittest.TestCase):
             ), redirect_stdout(output):
                 self.assertEqual(main(), 1)
             self.assertEqual(sorted(str(path.relative_to(root)) for path in root.rglob("*")), before)
-            self.assertEqual(len(output.getvalue().splitlines()), 6)
+            self.assertEqual(len(output.getvalue().splitlines()), 4)
 
             apply_install(targets, root / "backups", [claude_root, codex_root], canonical_root=source_root)
-            self.assertEqual(len([target for target in targets if target.target.is_symlink()]), 6)
+            self.assertEqual(len([target for target in targets if target.target.is_symlink()]), 4)
             self.assertEqual([target.target.resolve() for target in targets], [target.source.resolve() for target in targets])
             self.assertEqual(
                 sorted(path.name for path in claude_root.iterdir()),

@@ -11,7 +11,7 @@ from typing import Iterable, List, Optional, Sequence
 
 REPOSITORY_ROOT = Path(__file__).resolve().parent
 CANONICAL_SKILLS_ROOT = REPOSITORY_ROOT / "skills"
-SKILL_NAMES = ("consensus-plan", "consensus-code", "consensus-review")
+SKILL_NAMES = ("consensus-plan", "consensus-review")
 
 
 @dataclass(frozen=True)

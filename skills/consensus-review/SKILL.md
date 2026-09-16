@@ -1,6 +1,6 @@
 ---
 name: consensus-review
-description: Use when code already exists locally and needs direct Codex review with bounded Claude repair — a finished feature branch, an implementation completed by SDD or by hand, a bug fix that is ready for review, or a working tree with a clear review goal but no Plan document. Do not use for planning or for producing an initial implementation; use consensus-plan and consensus-code for those.
+description: Use when code already exists locally and needs direct Codex review with bounded Claude repair — a finished feature branch, an implementation completed by SDD or by hand, a bug fix that is ready for review, or a working tree with a clear review goal. Do not use when no code exists yet and what needs reviewing is a feature document; use consensus-plan for that read-only document review.
 ---
 
 # Consensus Review
@@ -10,9 +10,9 @@ one Claude repairs, verification re-runs, Codex re-reviews, and the run always
 stops for the human's final Code approval. You may clear the two gates inside
 that loop yourself; you may never clear the last one.
 
-Never create a Plan run, fake a Plan, or route existing code through
-`consensus-code`. `consensus-code` still requires a human-approved Plan; this
-skill is the only path for code that already exists.
+This is the only consensus entry for code. There is no Plan run to create and
+no Plan approval to route around: the skill layer offers no `plan` entry point
+at all, so code that already exists is reviewed here or not at all.
 
 Command map, in order:
 
@@ -136,11 +136,33 @@ summary/questions paths. Never paste patches, logs, prompts, or model transcript
 ## Responding to each gate
 
 **`AWAITING_USER_INPUT`** — ask Codex's persisted questions verbatim. Never answer
-for the user. Write one answers JSON object and submit it:
+for the user.
+
+The questions artifact (`questions_path`, reported by `status`) holds a list of
+`{"id": ..., "question": ...}` objects. Read it before writing anything. The
+answers file is a flat JSON object **keyed by the question `id`** — `Q-001`,
+`Q-002`, … — never by the question text, which is refused every time. Each value
+is that question's answer as one non-empty string, in the user's own words: one
+key per persisted question, no extras and none left out.
+
+```json
+{
+  "Q-001": "THE USER'S ANSWER TO Q-001, IN THEIR OWN WORDS",
+  "Q-002": "THE USER'S ANSWER TO Q-002"
+}
+```
+
+Then submit it:
 
 ```bash
 ai-review answer "REVIEW_RUN_ID" --answers "/private/tmp/answers.json"
 ```
+
+A file whose keys do not match the persisted ids exactly is refused as an input
+error (exit 2) naming the ids it expected, and the run stays parked at
+`AWAITING_USER_INPUT` — fix the file and submit again. The submission that is
+accepted is then the only one for that pause: a later file with different
+answers is refused, so only the exact same content can be retried.
 
 For a `CONTEXT_REQUEST` pause, offer at most three exact `path.md#Exact Heading`
 sections and submit them with `expand-context`. The packet is capped at 8,000
