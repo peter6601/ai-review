@@ -17,8 +17,11 @@ from typing import Iterable, Optional, Sequence, Tuple, Union
 
 DEFAULT_MAX_TOKENS = 8000
 DEFAULT_MAX_SOURCES = 3
+MAX_SOURCES_CEILING = 5
 MAX_EXPANSIONS = 2
 BUDGET_METHOD = "four_chars_per_token"
+BUDGET_METHOD_DOC = "non_ascii_per_token_v1"
+_ASCII_CHARS_PER_TOKEN = 4.0
 _ATX_HEADING = re.compile(r"^[ ]{0,3}(#{1,6})(?:[ \t]+|$)(.*)$")
 
 
@@ -86,6 +89,7 @@ class KnowledgePacket:
     revision: int = 1
     expansion_count: int = 0
     output_dir: Optional[str] = None
+    budget_method: str = BUDGET_METHOD
 
     @property
     def advisory_only(self) -> bool:
@@ -97,7 +101,7 @@ class KnowledgePacket:
             "revision": self.revision,
             "expansion_count": self.expansion_count,
             "max_context_tokens": self.max_context_tokens,
-            "budget_method": BUDGET_METHOD,
+            "budget_method": self.budget_method,
             "estimated_tokens": self.estimated_tokens,
             "checksum": self.checksum,
             "advisory_only": True,
@@ -157,12 +161,32 @@ def extract_section(path: Union[str, Path], heading: str) -> str:
     return _extract_section_from_text(source_path, heading, _read_source(source_path))
 
 
-def _estimate_tokens(markdown: str) -> int:
-    """Conservative fallback estimate retained in every packet manifest."""
-    return int(math.ceil(len(markdown) / 4.0))
+def estimate_tokens(markdown: str, budget_method: str = BUDGET_METHOD) -> int:
+    """Estimate tokens with the named method.
+
+    ``four_chars_per_token`` charges one token per four characters.  It is the
+    default because it reproduces, character for character, the estimate the
+    plan, code and review kinds were built with, so their stored packet
+    checksums keep validating.
+
+    ``non_ascii_per_token_v1`` charges one token per *non-ASCII codepoint* and
+    four ASCII characters per token.  It is not a CJK rule: accented Latin,
+    Cyrillic, emoji and non-breaking spaces each cost one token too, so a French
+    document is over-counted where a Traditional Chinese one is counted about
+    right.  ASCII characters are rounded up once for the whole document, never
+    per run of ASCII.
+    """
+    if budget_method == BUDGET_METHOD:
+        return int(math.ceil(len(markdown) / _ASCII_CHARS_PER_TOKEN))
+    elif budget_method == BUDGET_METHOD_DOC:
+        ascii_count = sum(1 for char in markdown if ord(char) < 128)
+        non_ascii_count = len(markdown) - ascii_count
+        return int(math.ceil(ascii_count / _ASCII_CHARS_PER_TOKEN)) + non_ascii_count
+    else:
+        raise ContextBudgetError("unknown budget method: %s" % budget_method)
 
 
-def _source_excerpt(reference: SourceRef) -> SourceExcerpt:
+def _source_excerpt(reference: SourceRef, budget_method: str) -> SourceExcerpt:
     path = Path(reference.path)
     try:
         source_bytes = path.read_bytes()
@@ -180,7 +204,7 @@ def _source_excerpt(reference: SourceRef) -> SourceExcerpt:
         priority=reference.priority,
         source_checksum=hashlib.sha256(source_bytes).hexdigest(),
         markdown=excerpt,
-        estimated_tokens=_estimate_tokens(excerpt),
+        estimated_tokens=estimate_tokens(excerpt, budget_method),
     )
 
 
@@ -205,10 +229,16 @@ def _validate_budget(max_tokens: int, estimated_tokens: int) -> int:
     return estimated_tokens
 
 
-def _packet_checksum(sources: Sequence[SourceExcerpt], checked: Sequence[str], max_tokens: int, revision: int) -> str:
+def _packet_checksum(
+    sources: Sequence[SourceExcerpt],
+    checked: Sequence[str],
+    max_tokens: int,
+    revision: int,
+    budget_method: str,
+) -> str:
     payload = {
         "advisory_only": True,
-        "budget_method": BUDGET_METHOD,
+        "budget_method": budget_method,
         "checked_not_selected": list(checked),
         "max_context_tokens": max_tokens,
         "revision": revision,
@@ -228,11 +258,16 @@ def _packet_checksum(sources: Sequence[SourceExcerpt], checked: Sequence[str], m
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
-def _render_packet(sources: Sequence[SourceExcerpt], estimated_tokens: int, checksum: str) -> str:
+def _render_packet(
+    sources: Sequence[SourceExcerpt],
+    estimated_tokens: int,
+    checksum: str,
+    budget_method: str,
+) -> str:
     lines = [
         "# Knowledge Packet",
         "",
-        "- budget_method: %s" % BUDGET_METHOD,
+        "- budget_method: %s" % budget_method,
         "- estimated_tokens: %s" % estimated_tokens,
         "- checksum: %s" % checksum,
         "- evidence_status: advisory_only (code and tests remain authoritative)",
@@ -254,13 +289,13 @@ def _render_packet(sources: Sequence[SourceExcerpt], estimated_tokens: int, chec
 
 
 def _render_with_token_estimate(
-    sources: Sequence[SourceExcerpt], checksum: str
+    sources: Sequence[SourceExcerpt], checksum: str, budget_method: str
 ) -> Tuple[int, str]:
     """Render until the displayed estimate matches the actual packet estimate."""
     estimate = 0
     for _ in range(16):
-        markdown = _render_packet(sources, estimate, checksum)
-        actual = _estimate_tokens(markdown)
+        markdown = _render_packet(sources, estimate, checksum, budget_method)
+        actual = estimate_tokens(markdown, budget_method)
         if actual == estimate:
             return actual, markdown
         estimate = actual
@@ -273,11 +308,13 @@ def _make_packet(
     max_tokens: int,
     revision: int,
     expansion_count: int,
+    *,
     output_dir: Optional[Union[str, Path]],
+    budget_method: str,
 ) -> KnowledgePacket:
     checked = _checked_not_selected(checked_paths, sources)
-    checksum = _packet_checksum(sources, checked, max_tokens, revision)
-    estimated, markdown = _render_with_token_estimate(sources, checksum)
+    checksum = _packet_checksum(sources, checked, max_tokens, revision, budget_method)
+    estimated, markdown = _render_with_token_estimate(sources, checksum, budget_method)
     _validate_budget(max_tokens, estimated)
     normalized_output = str(Path(output_dir).expanduser().resolve()) if output_dir else None
     return KnowledgePacket(
@@ -290,6 +327,7 @@ def _make_packet(
         revision=revision,
         expansion_count=expansion_count,
         output_dir=normalized_output,
+        budget_method=budget_method,
     )
 
 
@@ -308,14 +346,16 @@ def validate_knowledge_packet(packet: KnowledgePacket) -> KnowledgePacket:
         if (
             not isinstance(source, SourceExcerpt)
             or not re.fullmatch(r"[0-9a-f]{64}", source.source_checksum)
-            or source.estimated_tokens != _estimate_tokens(source.markdown)
+            or source.estimated_tokens != estimate_tokens(source.markdown, packet.budget_method)
         ):
             raise ContextBudgetError("knowledge packet source is invalid")
     checksum = _packet_checksum(
         packet.sources, packet.checked_not_selected,
-        packet.max_context_tokens, packet.revision,
+        packet.max_context_tokens, packet.revision, packet.budget_method,
     )
-    estimated, markdown = _render_with_token_estimate(packet.sources, checksum)
+    estimated, markdown = _render_with_token_estimate(
+        packet.sources, checksum, packet.budget_method
+    )
     _validate_budget(packet.max_context_tokens, estimated)
     if (
         not isinstance(packet.checksum, str)
@@ -334,6 +374,7 @@ def validate_knowledge_packet(packet: KnowledgePacket) -> KnowledgePacket:
         revision=packet.revision,
         expansion_count=packet.expansion_count,
         output_dir=None,
+        budget_method=packet.budget_method,
     )
 
 
@@ -378,17 +419,22 @@ def build_packet(
     max_sources: int = DEFAULT_MAX_SOURCES,
     checked_paths: Iterable[Union[str, Path]] = (),
     output_dir: Optional[Union[str, Path]] = None,
+    *,
+    budget_method: str = BUDGET_METHOD,
 ) -> KnowledgePacket:
-    """Build the initial bounded packet from no more than three sources."""
+    """Build the initial bounded packet within the caller's source cap."""
     references = tuple(sources)
-    if type(max_sources) is not int or max_sources <= 0 or max_sources > DEFAULT_MAX_SOURCES:
-        raise ContextBudgetError("max_sources must be between 1 and %s" % DEFAULT_MAX_SOURCES)
+    if type(max_sources) is not int or max_sources <= 0 or max_sources > MAX_SOURCES_CEILING:
+        raise ContextBudgetError("max_sources must be between 1 and %s" % MAX_SOURCES_CEILING)
     if len(references) > max_sources:
         raise ContextBudgetError("initial context may select no more than %s sources" % max_sources)
     if not references:
         raise ContextBudgetError("initial context requires at least one source")
-    excerpts = tuple(_source_excerpt(reference) for reference in references)
-    packet = _make_packet(excerpts, checked_paths, max_tokens, 1, 0, output_dir)
+    excerpts = tuple(_source_excerpt(reference, budget_method) for reference in references)
+    packet = _make_packet(
+        excerpts, checked_paths, max_tokens, 1, 0,
+        output_dir=output_dir, budget_method=budget_method,
+    )
     if output_dir is not None:
         _write_packet(packet, output_dir)
     return packet
@@ -407,7 +453,7 @@ def expand_packet(
     references = tuple(candidates)
     if not references:
         raise ContextExpansionError("context expansion requires a replacement candidate")
-    excerpts = tuple(_source_excerpt(reference) for reference in references)
+    excerpts = tuple(_source_excerpt(reference, packet.budget_method) for reference in references)
     evicted_index = min(range(len(packet.sources)), key=lambda index: (packet.sources[index].priority, index))
     remaining = list(packet.sources)
     checked_paths = set(packet.checked_not_selected)
@@ -424,7 +470,8 @@ def expand_packet(
                 packet.max_context_tokens,
                 packet.revision + 1,
                 packet.expansion_count + 1,
-                None,
+                output_dir=None,
+                budget_method=packet.budget_method,
             )
         except ContextBudgetError:
             continue
@@ -441,7 +488,8 @@ def expand_packet(
         packet.max_context_tokens,
         packet.revision + 1,
         packet.expansion_count + 1,
-        target_dir,
+        output_dir=target_dir,
+        budget_method=packet.budget_method,
     )
     if target_dir is not None:
         root = Path(target_dir).expanduser().resolve()

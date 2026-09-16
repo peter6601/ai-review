@@ -1,8 +1,9 @@
 """Strict loading for cross-project consensus limits."""
 
+import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Tuple
 
 import yaml
 
@@ -20,7 +21,15 @@ _REQUIRED_KEYS = {
     "production_line_limit",
     "production_growth_percent",
     "production_excludes",
+    "doc_max_initial_sources",
+    "doc_max_context_tokens",
+    "codex_model",
 }
+
+# The run kinds a context budget exists for.  ``context_limits`` refuses
+# anything else rather than handing back the shared pair, because a silently
+# wrong budget is the failure this mapping exists to prevent.
+_CONTEXT_KINDS = frozenset({"plan", "code", "review", "doc"})
 
 _MAXIMUMS = {
     "max_rounds": 6,
@@ -29,7 +38,16 @@ _MAXIMUMS = {
     "max_context_expansions": 2,
     "production_line_limit": 100,
     "production_growth_percent": 30,
+    "doc_max_initial_sources": 5,
+    "doc_max_context_tokens": 24000,
 }
+
+# ``codex_model`` is a requirement, not a numeric limit, so it stays out of
+# ``_MAXIMUMS`` and is checked by allowlist instead.  The value becomes one
+# argv element handed to a subprocess; it never reaches a shell, but a policy
+# file is the wrong place to accept arbitrary text, and refusing an
+# unvalidated value is this module's whole job.
+_MODEL_NAME = re.compile(r"[A-Za-z0-9._-]+")
 
 
 @dataclass(frozen=True)
@@ -42,6 +60,24 @@ class Policy:
     production_line_limit: int
     production_growth_percent: int
     production_excludes: list
+    doc_max_initial_sources: int
+    doc_max_context_tokens: int
+    # No default, deliberately: a Policy that can be built without a model is
+    # a Policy whose model can be silently substituted, which is the shape of
+    # the defect this field exists to close.  The pinned value has exactly one
+    # home, config/defaults.yaml.
+    codex_model: str
+
+    def context_limits(self, kind: str) -> Tuple[int, int]:
+        """(max_sources, max_tokens) for the run kind."""
+        if kind not in _CONTEXT_KINDS:
+            # PolicyError is a ValueError, and PlanWorkflow._expand_context
+            # catches ValueError: raised from there this surfaces as a
+            # CONTEXT_EXPANSION_FAILED pause, not as a propagating error.
+            raise PolicyError("no context limits for run kind: %r" % (kind,))
+        if kind == "doc":
+            return self.doc_max_initial_sources, self.doc_max_context_tokens
+        return self.max_initial_sources, self.max_context_tokens
 
 
 def _validate(contents: Any) -> Policy:
@@ -65,6 +101,11 @@ def _validate(contents: Any) -> Policy:
         isinstance(item, str) and item for item in excludes
     ):
         raise PolicyError("production_excludes must be a list of non-empty strings")
+    model = contents["codex_model"]
+    if type(model) is not str or not _MODEL_NAME.fullmatch(model):
+        raise PolicyError(
+            "codex_model must be a non-empty name of letters, digits, '.', '-', or '_'"
+        )
     return Policy(**contents)
 
 

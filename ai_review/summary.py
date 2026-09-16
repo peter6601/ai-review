@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
+from .doc_workflow import REPORT_SEVERITIES, doc_report_path
 from .models import RunState, Status, canonical_answer_submission, canonical_user_question_ids, strict_json_loads
 from .runners import (
     validate_claude_resolution, validate_codex_review, validate_plan_repair,
@@ -99,6 +100,8 @@ class _Evidence:
     selected_review_sequences: set[int]
     risk_categories: list = field(default_factory=list)
     specialist_counts: dict = field(default_factory=dict)
+    # The last doc round a human can act on.  Only a doc run ever sets it.
+    doc_round: Optional[dict] = None
 
 
 def generate_outputs(store: RunStore, run_id: str) -> SummaryOutputs:
@@ -115,6 +118,16 @@ def generate_outputs(store: RunStore, run_id: str) -> SummaryOutputs:
     artifacts = store._run_directory(state)
     candidate_path = artifacts / "knowledge-candidate.md"
     store.remove_artifact(candidate_path)
+    if state.kind == "doc":
+        # A doc run has no Plan to inherit, no repair loop to count and no
+        # knowledge to write back: one read-only pass produced findings, and
+        # rendering them is the whole job.
+        final_path = artifacts / "final-summary.md"
+        store.write_artifact_bytes(
+            final_path,
+            _doc_summary(state, _collect_doc_evidence(store, artifacts, state)).encode("utf-8"),
+        )
+        return SummaryOutputs(final_path, None)
     evidence = _collect_evidence(store, artifacts, state)
     _tag_phase(evidence, state.kind)
     # Only a Code run inherits Plan evidence. A Review run has no Plan at all and
@@ -209,6 +222,92 @@ def _collect_evidence(store: RunStore, artifacts: Path, state: RunState) -> _Evi
     _collect_human_arbitration(store, artifacts, evidence)
     _collect_unresolved(store, artifacts, state, evidence)
     return evidence
+
+
+def _collect_doc_evidence(store: RunStore, artifacts: Path, state: RunState) -> _Evidence:
+    """Collect only the evidence a doc run can actually have.
+
+    There are no resolutions, patch statistics or verification records to look
+    for: a doc run has no Claude to resolve a finding, writes no patch, and
+    runs no command.  What it has is its Codex rounds, the questions a round
+    asked, and — if something went wrong — a pause.
+    """
+    evidence = _Evidence([], [], [], [], [], [], set(), {}, {}, [], 0, None, False, {}, set(), set())
+    _record_artifact(evidence, "state", "state.json")
+    _collect_reviews(store, artifacts, evidence)
+    _collect_doc_round(store, artifacts, evidence)
+    _collect_pause(store, artifacts, state, evidence)
+    _collect_human_arbitration(store, artifacts, evidence)
+    return evidence
+
+
+def _collect_doc_round(store: RunStore, artifacts: Path, evidence: _Evidence) -> None:
+    """Select the last round a human can act on, and keep what it decided.
+
+    A CONTEXT_REQUEST round is skipped: it asked for evidence rather than
+    judging the document, and left no report beside it.  Only rounds whose
+    artifact ``_collect_reviews`` already selected are read, so the same cap
+    bounds both.
+    """
+    paths = [
+        path for path in store.list_artifacts(artifacts / "reviews", ".json")
+        if _SEQUENCE_JSON.fullmatch(path.name)
+    ]
+    for path in sorted(paths, key=lambda item: int(item.stem), reverse=True):
+        identifier = _artifact_identifier(path, artifacts)
+        if identifier not in evidence.artifacts:
+            continue
+        value = _read_json(store, path, identifier, evidence)
+        if value is None:
+            continue
+        try:
+            review = validate_codex_review(value)
+        except (TypeError, ValueError):
+            _invalid(identifier, evidence)
+            continue
+        if review["verdict"] == "CONTEXT_REQUEST":
+            continue
+        sequence = int(path.stem)
+        evidence.doc_round = {
+            "sequence": sequence,
+            "verdict": review["verdict"],
+            "findings": [_finding_view(item) for item in review["findings"]],
+            "questions": list(review["questions"]),
+            "report_number": _doc_report_number(store, artifacts, sequence, evidence),
+        }
+        return
+
+
+def _doc_report_number(
+    store: RunStore, artifacts: Path, sequence: int, evidence: _Evidence
+) -> Optional[int]:
+    """Read which report beside the document this round wrote.
+
+    Report numbers count the shelf beside the document across every run that
+    reviewed it, so they cannot be derived from the review sequence: the run
+    records the one it wrote.  Only the number is taken from the record and the
+    filename is rebuilt from the manifest, so no artifact can name a path of
+    its own.  This is one small file, read only for the single round the
+    summary renders.
+    """
+    path = artifacts / "doc-reports" / ("%04d.json" % sequence)
+    identifier = "doc-reports/%04d.json" % sequence
+    if not store.artifact_exists(path):
+        return None
+    value = _read_json(store, path, identifier, evidence)
+    if value is None:
+        return None
+    if (
+        not isinstance(value, dict)
+        or set(value) != {"review_sequence", "report_number"}
+        or type(value["review_sequence"]) is not int
+        or type(value["report_number"]) is not int
+        or value["review_sequence"] != sequence
+        or value["report_number"] < 1
+    ):
+        _invalid(identifier, evidence)
+        return None
+    return value["report_number"]
 
 
 def _collect_reviews(store: RunStore, artifacts: Path, evidence: _Evidence) -> None:
@@ -730,8 +829,7 @@ def _final_summary(state: RunState, evidence: _Evidence) -> str:
     else:
         verification_lines.append("- 沒有可安全引用的 Diff 統計。")
     if evidence.errors:
-        omitted = "；另有 %d 個無效 artifact 未列出" % evidence.error_omitted if evidence.error_omitted else ""
-        decision_lines = ["- 無法安全產生完整摘要；請檢查受保護 artifact：%s%s。" % (", ".join(_display(evidence, item) for item in sorted(evidence.errors)), omitted)]
+        decision_lines = [_unsafe_evidence_line(evidence)]
     elif state.status == Status.AWAITING_USER_INPUT or evidence.unresolved or state.status == Status.PAUSED:
         items = blockers or ["目前工作流程在人工 gate 暫停。"]
         decision_lines = ["- 需要你決定：%s" % "; ".join(_section_values(evidence, items, "decision"))]
@@ -749,6 +847,107 @@ def _final_summary(state: RunState, evidence: _Evidence) -> str:
         ("## Verification 與 Diff", verification_lines),
         ("## 需要你決定", decision_lines),
     ))
+
+
+def _unsafe_evidence_line(evidence: _Evidence) -> str:
+    """The single line every summary shows when its own evidence is untrustworthy."""
+    omitted = "；另有 %d 個無效 artifact 未列出" % evidence.error_omitted if evidence.error_omitted else ""
+    return "- 無法安全產生完整摘要；請檢查受保護 artifact：%s%s。" % (", ".join(_display(evidence, item) for item in sorted(evidence.errors)), omitted)
+
+
+def _doc_summary(state: RunState, evidence: _Evidence) -> str:
+    """Render the one thing a doc run produces: findings a human acts on.
+
+    Deliberately absent: repair rounds, verification results, diff statistics,
+    Claude's side of a consensus and any approved-Plan evidence.  A doc run has
+    none of them, and a section that could only ever say "none" would suggest
+    the opposite.
+    """
+    round_record = evidence.doc_round or {}
+    verdict = round_record.get("verdict")
+    findings = round_record.get("findings", [])
+    scope_lines = _doc_scope_lines(state, evidence, verdict)
+    finding_lines = _section_bullets(
+        evidence,
+        [
+            "%s：%s（%s）" % (
+                _display(evidence, item["severity"]),
+                _display(evidence, item["id"]),
+                _display(evidence, item["invariant"]),
+            )
+            for item in _doc_ordered_findings(findings)
+        ],
+        "- 這一輪沒有回報 findings。", "doc-findings",
+    )
+    question_lines = _section_bullets(
+        evidence,
+        [_display(evidence, question) for question in round_record.get("questions", [])],
+        "- 沒有待回答的問題。", "doc-questions",
+    )
+    return _render_document("# Document Review Summary", (
+        ("## 這次審查", scope_lines),
+        ("## Findings", finding_lines),
+        ("## 待回答問題", question_lines),
+        ("## 文件旁的報告", _doc_report_lines(state, evidence, round_record)),
+        ("## 需要你決定", _doc_decision_lines(state, evidence, findings)),
+    ))
+
+
+def _doc_scope_lines(state: RunState, evidence: _Evidence, verdict: Optional[str]) -> list[str]:
+    """Name the document, the standard it was judged by, and this round's verdict."""
+    manifest = state.manifest
+    if manifest is None:
+        return ["- 這個 run 沒有可安全引用的 doc manifest。"]
+    return [
+        "- 文件：%s" % _display(evidence, _repository_relative(manifest, Path(manifest.doc_path))),
+        "- Lens：%s（%s）" % (
+            _display(evidence, manifest.lens), _display(evidence, manifest.lens_reason)
+        ),
+        "- Brief：%s" % _display(evidence, manifest.brief),
+        "- Verdict：%s" % (
+            _display(evidence, verdict) if verdict else "尚未完成任何一輪審查"
+        ),
+        "- 狀態：%s" % _display(evidence, state.status.value),
+    ]
+
+
+def _doc_report_lines(state: RunState, evidence: _Evidence, round_record: dict) -> list[str]:
+    """Point at the report this round wrote beside the document."""
+    number = round_record.get("report_number")
+    if state.manifest is None or not isinstance(number, int):
+        return ["- 這一輪沒有產生文件旁的報告。"]
+    report = doc_report_path(state.manifest.doc_path, number)
+    return ["- %s" % _display(evidence, _repository_relative(state.manifest, report))]
+
+
+def _doc_decision_lines(state: RunState, evidence: _Evidence, findings: list) -> list[str]:
+    """Say what only the human can do next — starting with what a PASS is not."""
+    if evidence.errors:
+        return [_unsafe_evidence_line(evidence)]
+    lines = ["- Codex 的 PASS 只表示這一輪沒有找到問題，不是核准：文件要不要採用由你決定。"]
+    if state.status == Status.AWAITING_USER_INPUT:
+        lines.append("- 逐題回答上面的問題後，下一輪會帶著你的答案重讀文件。")
+    elif findings:
+        lines.append("- 讀文件旁的報告、自己修文件，再跑一次 re-review。")
+    if evidence.pause_reason:
+        lines.append("- 這次 run 已暫停：%s。" % _display(evidence, evidence.pause_reason))
+    return lines
+
+
+def _doc_ordered_findings(findings: Iterable[dict]) -> list[dict]:
+    """Group findings by severity, most urgent first, then by identifier."""
+    order = {severity: index for index, (severity, _heading) in enumerate(REPORT_SEVERITIES)}
+    return sorted(
+        findings, key=lambda item: (order.get(item["severity"], len(order)), item["id"])
+    )
+
+
+def _repository_relative(manifest: Any, path: Path) -> str:
+    """Name a repository file the way a human types it, never as a local path."""
+    try:
+        return path.relative_to(Path(manifest.repo_path)).as_posix()
+    except (TypeError, ValueError):
+        return path.name
 
 
 def _review_scope_lines(state: RunState, evidence: _Evidence) -> list[str]:

@@ -22,12 +22,14 @@ import tempfile
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, NoReturn, Optional
 
-from .context import SourceRef, build_packet
+from .context import BUDGET_METHOD_DOC, SourceRef, build_packet
 from .git_diff import capture_diff_bytes
 from .models import (
-    ApprovalAuthority, HumanApprovalReceipt, ReviewApprovalAttestation,
-    ReviewApprovalReceipt, ReviewManifest, RiskApprovalReceipt, RunState, Status,
-    VerificationCommand, sign_risk_approval, strict_json_loads, verify_risk_approval,
+    DOC_LENSES, ApprovalAuthority, DocManifest, HumanApprovalReceipt,
+    ReviewApprovalAttestation, ReviewApprovalReceipt, ReviewManifest,
+    RiskApprovalReceipt, RunState, Status, VerificationCommand,
+    canonical_user_question_ids, sign_risk_approval, strict_json_loads,
+    verify_risk_approval,
 )
 from .runners import RunnerError, RunnerInterrupted, build_claude_argv, build_codex_argv, validate_codex_review
 from .store import PRODUCTION_WORKSPACE_ROOT, RunStore, git_worktree_root
@@ -44,6 +46,8 @@ from .auto_approval import (
     ledger_path,
     reserve as reserve_auto_approval,
 )
+from .doc_workflow import DocWorkflow
+from .policy import Policy, load_policy
 from .preflight import PreflightError, load_preflight_text
 from .review_workflow import DirectReviewWorkflow
 from .workflow import CodeWorkflow, PlanWorkflow
@@ -126,10 +130,27 @@ def _parser() -> argparse.ArgumentParser:
     review.add_argument("--profile", choices=("generic", "ios"), required=True)
     review.add_argument("--source", action="append", default=[])
     review.add_argument("--verify", action="append", default=[])
+    # A doc run is one read-only pass over a document: it runs no command, so
+    # there is deliberately no --verify here.  Passing one must be an argparse
+    # error rather than a flag the caller believes was honoured.
+    doc = kinds.add_parser("doc")
+    doc.add_argument("--repo", required=True)
+    doc.add_argument("--doc", required=True)
+    doc.add_argument("--base", default="HEAD")
+    doc.add_argument("--lens", choices=list(DOC_LENSES), required=True)
+    doc.add_argument("--lens-reason", required=True)
+    doc.add_argument("--brief", required=True)
+    doc.add_argument("--source", action="append", default=[])
 
     for name in ("run", "resume"):
         item = commands.add_parser(name)
         item.add_argument("run_id")
+    # A second round over a document the human has edited.  It deliberately
+    # takes no flags: nothing but the document's bytes may change between
+    # rounds, and there is no --force, because a fresh opinion on unchanged
+    # bytes is `init doc`, which leaves its own audit trail.
+    re_review = commands.add_parser("re-review")
+    re_review.add_argument("run_id")
     answer = commands.add_parser("answer")
     answer.add_argument("run_id")
     answer.add_argument("--answers", required=True)
@@ -178,22 +199,59 @@ def _resolve_repo(raw: str) -> Path:
     return git_worktree_root(Path(raw))
 
 
-def _resolve_plan(repo: Path, raw: str) -> Path:
+def _resolve_repository_file(repo: Path, raw: str, *, label: str) -> Path:
+    """Resolve one readable regular file that lives inside the repository.
+
+    Plan and doc runs both bind a single file by content, so they share one
+    rule; only the noun in the message differs, so a caller is told which input
+    was rejected.
+    """
     candidate = Path(raw).expanduser()
-    plan = (repo / candidate).resolve() if not candidate.is_absolute() else candidate.resolve()
-    if not plan.is_file():
-        raise CliInputError("Plan file must be a readable regular file")
+    resolved = (repo / candidate).resolve() if not candidate.is_absolute() else candidate.resolve()
+    if not resolved.is_file():
+        raise CliInputError("%s must be a readable regular file" % label)
     try:
-        plan.relative_to(repo)
+        resolved.relative_to(repo)
     except ValueError as error:
-        raise CliInputError("Plan file must be inside repository") from error
-    return plan
+        raise CliInputError("%s must be inside repository" % label) from error
+    return resolved
+
+
+def _resolve_plan(repo: Path, raw: str) -> Path:
+    return _resolve_repository_file(repo, raw, label="Plan file")
+
+
+def _resolve_document(repo: Path, raw: str) -> Path:
+    return _resolve_repository_file(repo, raw, label="document")
+
+
+def _central_policy() -> Policy:
+    """Load the same central policy the workflows load, from the same file.
+
+    Both the doc caps and the pinned Codex model come from here, so there is
+    exactly one way for the CLI to reach the policy file.
+    """
+    return load_policy(_ROOT / "config" / "defaults.yaml")
+
+
+def _doc_source_refs(values: Iterable[str], *, max_sources: int) -> tuple[SourceRef, ...]:
+    """Apply the doc source cap from policy, then the shared per-source rule."""
+    raw = tuple(values)
+    if len(raw) > max_sources:
+        raise CliInputError(
+            "initial context may select no more than %d exact source sections" % max_sources
+        )
+    return _validated_source_refs(raw)
 
 
 def _source_refs(values: Iterable[str]) -> tuple[SourceRef, ...]:
     raw = tuple(values)
     if len(raw) > 3:
         raise CliInputError("initial context may select no more than 3 exact source sections")
+    return _validated_source_refs(raw)
+
+
+def _validated_source_refs(raw: tuple) -> tuple[SourceRef, ...]:
     refs = []
     for value in raw:
         path_text, separator, section = value.rpartition("#")
@@ -314,6 +372,7 @@ def _payload(store: RunStore, state: RunState) -> dict[str, Any]:
         Status.AWAITING_USER_INPUT.value: "answer",
         Status.AWAITING_HUMAN_PLAN_REVIEW.value: "human_plan_review",
         Status.AWAITING_HUMAN_CODE_REVIEW.value: "human_code_review",
+        Status.AWAITING_HUMAN_DOC_REVIEW.value: "human_doc_review",
         Status.AWAITING_REVIEW_APPROVAL.value: "human_review_scope",
         Status.AWAITING_PREFLIGHT.value: "submit_preflight",
         Status.PAUSED.value: "human_decision",
@@ -335,6 +394,18 @@ def _payload(store: RunStore, state: RunState) -> dict[str, Any]:
             "brief_digest": state.manifest.brief_digest,
             "initial_patch_digest": state.manifest.initial_patch_digest,
             "profile": state.manifest.profile,
+        })
+    elif isinstance(state.manifest, DocManifest):
+        # The doc equivalent of the plan-digest receipt: a person can bind the
+        # findings they are about to read to the exact document bytes on disk,
+        # under the lens and purpose the review was run with.  A doc run has no
+        # Plan, so it never reports a plan_digest.
+        payload.update({
+            "doc_digest": hashlib.sha256(
+                Path(state.manifest.doc_path).read_bytes()
+            ).hexdigest(),
+            "lens": state.manifest.lens,
+            "brief_digest": state.manifest.brief_digest,
         })
     else:
         # This is the human-review receipt: it lets a person bind approval to
@@ -360,6 +431,121 @@ def _read_json_object(path_text: str) -> Mapping[str, str]:
     return value
 
 
+# How much of an unexpected key to quote back. A key that is really a whole
+# question runs to a paragraph, and the reader only needs to recognise it.
+_ANSWER_KEY_PREVIEW = 32
+_ANSWER_KEYS_SHOWN = 3
+
+
+def _key_preview(keys: list[str]) -> str:
+    """Name the unexpected keys without pasting whole questions back at a reader."""
+    shown = [
+        key if len(key) <= _ANSWER_KEY_PREVIEW else key[:_ANSWER_KEY_PREVIEW] + "..."
+        for key in keys[:_ANSWER_KEYS_SHOWN]
+    ]
+    if len(keys) > _ANSWER_KEYS_SHOWN:
+        shown.append("and %d more" % (len(keys) - _ANSWER_KEYS_SHOWN))
+    return ", ".join('"%s"' % item for item in shown)
+
+
+def _persisted_question_ids(store: RunStore, state: RunState) -> Optional[tuple[str, ...]]:
+    """Read the ids this pause is waiting on, writing nothing.
+
+    Deliberately not ``PlanWorkflow._active_question_cycle``: that helper
+    migrates a legacy first-cycle run into the sequenced layout, which is a
+    write, and a rejected input must leave the run byte-identical. ``None``
+    means the questions could not be read at all, which is a broken run for the
+    workflow to refuse rather than an operator's typo to correct.
+    """
+    directory = store._run_directory(state)
+    cycles = [
+        int(path.name)
+        for path in store.list_artifact_directories(directory / "question-cycles")
+        if path.name.isdigit()
+    ]
+    path = (
+        directory / "question-cycles" / ("%04d" % max(cycles)) / "questions.json"
+        if cycles else directory / "user-questions.json"
+    )
+    try:
+        raw = store.read_optional_artifact_bytes(path)
+        if raw is None:
+            return None
+        contents = strict_json_loads(raw.decode("utf-8"))
+        return canonical_user_question_ids(
+            contents.get("questions") if isinstance(contents, dict) else None
+        )
+    except (ValueError, OSError, UnicodeDecodeError):
+        return None
+
+
+def _answerable(state: RunState) -> None:
+    """Refuse ``answer`` on a run that is not parked on questions.
+
+    Each workflow's own ``status != AWAITING_USER_INPUT`` check stays where it
+    is and remains the authority; but it raises *inside* ``answer()``, whose
+    except clause pauses.  So an ``answer`` aimed at an already-``PAUSED`` run
+    re-paused it: ``pause.json`` is the only record of why a run stopped, and a
+    run killed by ``INVALID_CODEX_REVIEW`` came back reading
+    ``INVALID_DOC_USER_ANSWER`` -- the real cause gone.  Worse, the command
+    exited 0, so nothing told the operator they had just erased it.  A live
+    ``READY`` or ``AWAITING_HUMAN_DOC_REVIEW`` run was destroyed the same way:
+    moved to ``PAUSED``, which no command returns from.
+
+    The same check one layer out is an input error (exit 2) that touches
+    nothing.  It is checked before ``_checked_answers`` because the answers
+    file is beside the point on a run that cannot be answered at all.
+    """
+    if state.status != Status.AWAITING_USER_INPUT:
+        raise CliInputError(
+            "answer requires a run parked at AWAITING_USER_INPUT, not %s"
+            % state.status.value
+        )
+
+
+def _checked_answers(
+    store: RunStore, state: RunState, answers: Mapping[str, str],
+) -> Mapping[str, str]:
+    """Refuse a malformed answers file before a workflow can pause the run.
+
+    ``_validate_answers`` stays where it is as the authority boundary, but it
+    runs *inside* ``answer()``, whose except clause pauses the run -- and no
+    command returns a ``PAUSED`` run to ``AWAITING_USER_INPUT``. One typo in a
+    JSON file therefore discarded a completed, separately billed Codex round;
+    the skill's own wording produced exactly such a file every time. This is the
+    same shape check one layer out, where a bad file is an input error and the
+    run is never touched.
+
+    Every kind that can ask questions is gated, not just ``doc``: ``plan`` and
+    ``review`` pause the same unrecoverable way, on rounds that cost more.
+    """
+    if state.status != Status.AWAITING_USER_INPUT:
+        # Not this gate's business; the workflow owns the state check.
+        return answers
+    expected = _persisted_question_ids(store, state)
+    if expected is None:
+        return answers
+    known = set(expected)
+    supplied = set(answers)
+    missing = sorted(known - supplied)
+    unexpected = sorted(supplied - known)
+    blank = sorted(key for key in supplied & known if not answers[key].strip())
+    if not (missing or unexpected or blank):
+        return answers
+    parts = [
+        "answers must be a JSON object keyed by question id, not by question "
+        "text: expected %s" % ", ".join(expected)
+    ]
+    if missing:
+        parts.append("missing %s" % ", ".join(missing))
+    if unexpected:
+        parts.append("unexpected %s" % _key_preview(unexpected))
+    if blank:
+        parts.append("empty answer for %s" % ", ".join(blank))
+    # No answer value is ever quoted: they are the user's words, and long.
+    raise CliInputError("; ".join(parts))
+
+
 def _oid(repo: Path, ref: str) -> str:
     try:
         completed = run_git(
@@ -380,16 +566,38 @@ class _LocalCodex:
     _PROMPTS = {"plan": "codex-plan.md", "code": "codex-code.md", "review": "codex-review.md"}
 
     def __init__(
-        self, repo: Path, identity: Optional[Mapping[str, Any]] = None, *, mode: str = "code",
+        self, repo: Path, identity: Optional[Mapping[str, Any]] = None, *, model: str,
+        mode: str = "code", lens: Optional[str] = None,
     ):
         self.repo = repo
-        if mode not in self._PROMPTS:
-            raise ValueError("Codex mode must be plan, code, or review")
+        if mode not in self._PROMPTS and mode != "doc":
+            raise ValueError("Codex mode must be plan, code, review, or doc")
+        # A doc review's standard is the lens, so the lens picks the prompt.
+        # Requiring it here keeps a doc run from silently being judged by some
+        # default standard, and refusing it elsewhere keeps the other three
+        # modes exactly as they were.
+        if mode == "doc":
+            if lens not in DOC_LENSES:
+                raise ValueError("a doc review requires one of the three document lenses")
+        elif lens is not None:
+            raise ValueError("only a doc review is selected by lens")
         self.mode = mode
+        self.lens = lens
+        # Required, with no fall back: the model is this tool's own
+        # requirement, and every caller states it from the central policy.  A
+        # default here -- even one resolved from that same policy -- would
+        # leave a path that a forgetful caller can take without saying so.
+        self.model = model
         self.identity = dict(identity or resolve_executable("codex", path=os.environ.get("PATH")))
 
+    @property
+    def prompt_name(self) -> str:
+        if self.mode == "doc":
+            return "codex-doc-%s.md" % self.lens
+        return self._PROMPTS[self.mode]
+
     def review(self, inputs: Mapping[str, Any]) -> Any:
-        prompt = (_ROOT / "prompts" / self._PROMPTS[self.mode]).read_text(encoding="utf-8")
+        prompt = (_ROOT / "prompts" / self.prompt_name).read_text(encoding="utf-8")
         prompt += "\n\nINPUT_JSON:\n" + json.dumps(inputs, ensure_ascii=False, sort_keys=True)
         schema = _ROOT / "schemas" / "codex-review.schema.json"
         with tempfile.TemporaryDirectory(prefix="ai-review-codex-") as raw:
@@ -397,7 +605,10 @@ class _LocalCodex:
             if output.exists() or output.is_symlink():
                 raise RunnerError("Codex output path was not fresh")
             executable = validate_executable_identity(self.identity)
-            argv = build_codex_argv(self.repo, schema, output, prompt, executable=executable)
+            argv = build_codex_argv(
+                self.repo, schema, output, prompt,
+                model=self.model, executable=executable,
+            )
             return _run_codex_with_output(argv, self.repo, output, Path(raw))
 
 
@@ -520,7 +731,23 @@ def _external_failure_detail(exit_code: int, stderr: str) -> str:
 def _default_workflow_factory(*, kind: str, store: RunStore, state: RunState, context_packet: Any = None) -> Any:
     repo = Path(state.manifest.repo_path)
     identities = state.manifest.review_executables
-    codex = _LocalCodex(repo, identities.get("codex"), mode=kind)
+    # Read once, here, and hand it to every kind: the pinned model is a
+    # property of the tool, so no run of any kind may be judged by whatever
+    # the machine's global Codex config happens to name.
+    model = _central_policy().codex_model
+    if kind == "doc":
+        # No Claude is built at all: DocWorkflow replaces whatever it is given
+        # with a guard that raises, so there is nothing here to pass it.
+        return DocWorkflow(
+            store,
+            _LocalCodex(
+                repo, identities.get("codex"), mode="doc",
+                lens=state.manifest.lens, model=model,
+            ),
+            None,
+            context_packet=context_packet,
+        )
+    codex = _LocalCodex(repo, identities.get("codex"), mode=kind, model=model)
     claude = _LocalClaude(repo, mode=kind, identity=identities.get("claude"))
     if kind == "plan":
         return PlanWorkflow(store, codex, claude, context_packet=context_packet)
@@ -760,6 +987,84 @@ def _init_review(args: argparse.Namespace, store: RunStore) -> RunState:
     return state
 
 
+def _init_doc(args: argparse.Namespace, store: RunStore) -> RunState:
+    """Create one read-only document review bound to exact bytes and one lens.
+
+    The Plan and Review init paths build their packet on ``build_packet``'s own
+    defaults and so never read policy at all.  A doc run must not inherit that:
+    its caps are the policy's doc caps, read here, so the source cap and the
+    token budget a caller is held to are the ones the run is created under.
+    """
+    repo = _resolve_repo(args.repo)
+    document = _resolve_document(repo, args.doc)
+    policy = _central_policy()
+    max_sources, max_tokens = policy.context_limits("doc")
+    refs = _doc_source_refs(args.source, max_sources=max_sources)
+    # Freeze the base and prove every claimed section exists before any durable
+    # state is created; a rejected request must leave no runnable run behind.
+    base_oid = _oid(repo, args.base)
+    packet = build_packet(
+        refs, max_sources=max_sources, max_tokens=max_tokens,
+        budget_method=BUDGET_METHOD_DOC,
+    ) if refs else None
+    brief = args.brief.strip()
+    manifest = DocManifest(
+        kind="doc", repo_path=str(repo), doc_path=str(document),
+        base_ref=args.base, base_oid=base_oid,
+        lens=args.lens, lens_reason=args.lens_reason, brief=brief,
+        brief_digest=hashlib.sha256(brief.encode("utf-8")).hexdigest(),
+        doc_digest=hashlib.sha256(document.read_bytes()).hexdigest(),
+        knowledge_sources=[str(ref.path) for ref in refs],
+        context_checksum=packet.checksum if packet is not None else None,
+        # A doc run only ever invokes Codex, but the identity binding is whole
+        # or empty; dropping Claude here would quietly weaken the check.
+        review_executables={
+            "codex": resolve_executable("codex", path=os.environ.get("PATH")),
+            "claude": resolve_executable("claude", path=os.environ.get("PATH")),
+        },
+    )
+    state = store.create(RunState.new_doc(manifest))
+    if packet is not None:
+        PlanWorkflow(store, None, None, context_packet=packet)._persist_context_packet(
+            store._run_directory(state), packet
+        )
+    return state
+
+
+def _rebound_doc_run(args: argparse.Namespace, store: RunStore) -> RunState:
+    """Rebind one finished doc review to the document's new bytes.
+
+    This is the second half of the human loop: read the findings, edit the
+    document, ask again.  The run is parked at ``AWAITING_HUMAN_DOC_REVIEW``,
+    which the doc workflow halts on, so it takes a deliberate command to move
+    it back to ``RUNNING`` — and the previous round's findings already reach
+    the next ``_review_input`` through ``unresolved-findings.json``, so nothing
+    is carried forward by hand here.
+    """
+    state = store.load(args.run_id)
+    if state.kind != "doc" or not isinstance(state.manifest, DocManifest):
+        raise CliInputError("re-review requires a doc run")
+    if state.status != Status.AWAITING_HUMAN_DOC_REVIEW:
+        raise CliInputError(
+            "re-review requires a doc review awaiting its reader, not %s"
+            % state.status.value
+        )
+    repo = _resolve_repo(state.manifest.repo_path)
+    # The same rule init used: readable, a regular file, and inside the repo.
+    document = _resolve_document(repo, state.manifest.doc_path)
+    try:
+        digest = hashlib.sha256(document.read_bytes()).hexdigest()
+    except OSError as error:
+        raise CliInputError("document must be a readable regular file") from error
+    if hmac.compare_digest(digest, state.manifest.doc_digest):
+        # Reviewing the same bytes again would spend a whole Codex session to
+        # produce the findings the operator is already holding.
+        raise CliInputError("document is unchanged since the last review")
+    state.rebind_document(digest)
+    store.save(state)
+    return state
+
+
 def _approve(args: argparse.Namespace, store: RunStore) -> RunState:
     state = store.load(args.run_id)
     if state.kind != "plan" or state.manifest is None:
@@ -814,10 +1119,18 @@ def _validate_review_approval_inputs(
         packet = PlanWorkflow(store, None, None)._load_context_packet(artifacts)
         if packet.checksum != manifest.context_checksum:
             raise CliInputError("Review context packet does not match the manifest")
-        rebuilt = build_packet(tuple(
-            SourceRef(source.path, source.section, source.reason, source.priority)
-            for source in packet.sources
-        ))
+        rebuilt = build_packet(
+            tuple(
+                SourceRef(source.path, source.section, source.reason, source.priority)
+                for source in packet.sources
+            ),
+            max_tokens=packet.max_context_tokens,
+            # The packet's own source count, not the Plan default: a packet that
+            # legitimately carries more would otherwise fail the rebuild with a
+            # cap error instead of the checksum comparison this gate is for.
+            max_sources=len(packet.sources),
+            budget_method=packet.budget_method,
+        )
         if rebuilt.checksum != manifest.context_checksum:
             raise CliInputError("Review context sources changed before approval")
     return current_patch_digest, current_base_oid
@@ -1203,6 +1516,8 @@ def main(
                 state = _init_plan(args, store)
             elif args.kind == "code":
                 state = _init_code(args, store)
+            elif args.kind == "doc":
+                state = _init_doc(args, store)
             else:
                 state = _init_review(args, store)
         elif args.command == "status":
@@ -1221,6 +1536,10 @@ def main(
         elif args.command == "answer":
             answers = _read_json_object(args.answers)
             state = store.load(args.run_id)
+            # Both checked here, not inside the workflow, so a wrong state or a
+            # bad file costs the operator a retry instead of the whole run.
+            _answerable(state)
+            answers = _checked_answers(store, state, answers)
             state = _workflow(store, state, workflow_factory).answer(state.run_id, answers)
         elif args.command == "submit-preflight":
             submission = _read_preflight_submission(args.findings)
@@ -1230,6 +1549,11 @@ def main(
             state = _workflow(store, state, workflow_factory).submit_preflight(
                 state.run_id, submission
             )
+        elif args.command == "re-review":
+            # Rebind first, then run exactly as `run` does, so a second round
+            # is backgroundable and resumable like every other long command.
+            state = _rebound_doc_run(args, store)
+            state = _workflow(store, state, workflow_factory).run(state.run_id)
         elif args.command == "expand-context":
             state = store.load(args.run_id)
             state = _workflow(store, state, workflow_factory).provide_context(
@@ -1241,6 +1565,7 @@ def main(
         if args.command != "status" and state.status in (
             Status.AWAITING_HUMAN_PLAN_REVIEW,
             Status.AWAITING_HUMAN_CODE_REVIEW,
+            Status.AWAITING_HUMAN_DOC_REVIEW,
             Status.PAUSED,
         ):
             generate_outputs(store, state.run_id)

@@ -92,7 +92,19 @@ class CodeWorkflowTests(unittest.TestCase):
         self.base = self.git("rev-parse", "HEAD").stdout.strip()
         self.authority = ApprovalAuthority(self.root / "approval.key")
         self.store = RunStore(self.root / "runs", authority=self.authority)
-        policy = self.policy = Policy(1, 6, 8000, 3, 2, 100, 30, ["docs/**"])
+        policy = self.policy = Policy(
+            version=1,
+            max_rounds=6,
+            max_context_tokens=8000,
+            max_initial_sources=3,
+            max_context_expansions=2,
+            production_line_limit=100,
+            production_growth_percent=30,
+            production_excludes=["docs/**"],
+            doc_max_initial_sources=5,
+            doc_max_context_tokens=16000,
+            codex_model="gpt-5.6-sol",
+        )
         plan = self.store.create(RunState.new(
             "plan", str(self.plan), str(self.repo), self.base,
             verification_commands=[{"kind": "test", "argv": ["python3", "-m", "unittest", "tests.task"], "scope": "task"}],

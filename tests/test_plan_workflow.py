@@ -1,11 +1,14 @@
+import contextlib
 import hashlib
+import inspect
 import json
 import subprocess
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
-from ai_review.context import SourceRef, build_packet
+from ai_review.context import BUDGET_METHOD, SourceRef, build_packet
 from ai_review.models import RunState, Status
 from ai_review.policy import Policy
 from ai_review.runners import RunnerError, RunnerInterrupted
@@ -65,6 +68,34 @@ def plan_update(previous, updated, answers, changed_sections=("Plan",)):
     }
 
 
+@contextlib.contextmanager
+def record_build_packet():
+    """Record the arguments that actually reach ``context.build_packet``.
+
+    The bootstrap's caps are invisible from the outside once a small packet
+    fits under any of them, so a literal in place of the policy read passes
+    every behavioural assertion.  Binding the real signature captures the
+    values whatever call style the caller uses.
+    """
+    from ai_review import workflow as workflow_module
+
+    real = workflow_module.build_packet
+    signature = inspect.signature(real)
+    calls = []
+
+    def spy(*args, **kwargs):
+        bound = signature.bind(*args, **kwargs)
+        bound.apply_defaults()
+        calls.append(dict(bound.arguments))
+        return real(*args, **kwargs)
+
+    workflow_module.build_packet = spy
+    try:
+        yield calls
+    finally:
+        workflow_module.build_packet = real
+
+
 class FakeCodex:
     def __init__(self, responses):
         self.responses = list(responses)
@@ -119,10 +150,58 @@ class PlanWorkflowTests(unittest.TestCase):
         self.plan.write_text("# Plan\nInitial\n", encoding="utf-8")
         self.store = RunStore(self.root / "runs")
         self.run = self.store.create(RunState.new("plan", str(self.plan), str(self.repo), "HEAD"))
-        self.policy = Policy(1, 6, 8000, 3, 2, 100, 30, ["docs/**"])
+        self.policy = Policy(
+            version=1,
+            max_rounds=6,
+            max_context_tokens=8000,
+            max_initial_sources=3,
+            max_context_expansions=2,
+            production_line_limit=100,
+            production_growth_percent=30,
+            production_excludes=["docs/**"],
+            doc_max_initial_sources=5,
+            doc_max_context_tokens=16000,
+            codex_model="gpt-5.6-sol",
+        )
 
     def tearDown(self):
         self.temp.cleanup()
+
+    def test_persisted_packet_record_rejects_unknown_and_missing_keys(self):
+        source = self.repo / "brain.md"
+        source.write_text("# A\nx\n", encoding="utf-8")
+        packet = build_packet([SourceRef(source, "A", "r")], max_tokens=1000)
+        record = PlanWorkflow._packet_record(packet)
+        artifacts = self.root / "artifacts"
+
+        self.assertEqual(
+            PlanWorkflow._packet_from_record(dict(record), artifacts).checksum,
+            packet.checksum,
+        )
+
+        unknown = dict(record)
+        unknown["unexpected"] = True
+        with self.assertRaises(WorkflowError):
+            PlanWorkflow._packet_from_record(unknown, artifacts)
+
+        for key in sorted(set(record) - {"budget_method"}):
+            with self.subTest(missing=key):
+                incomplete = dict(record)
+                del incomplete[key]
+                with self.assertRaises(WorkflowError):
+                    PlanWorkflow._packet_from_record(incomplete, artifacts)
+
+    def test_persisted_packet_record_still_accepts_records_without_a_budget_method(self):
+        source = self.repo / "brain.md"
+        source.write_text("# A\nx\n", encoding="utf-8")
+        packet = build_packet([SourceRef(source, "A", "r")], max_tokens=1000)
+        record = PlanWorkflow._packet_record(packet)
+        del record["budget_method"]
+
+        restored = PlanWorkflow._packet_from_record(record, self.root / "artifacts")
+
+        self.assertEqual(restored.budget_method, packet.budget_method)
+        self.assertEqual(restored.checksum, packet.checksum)
 
     @property
     def artifacts(self):
@@ -359,6 +438,71 @@ class PlanWorkflowTests(unittest.TestCase):
         self.assertIsNotNone(result.manifest.context_checksum)
         self.assertTrue((self.artifacts / "knowledge-packet-r1.md").exists())
 
+    def test_bootstrap_caps_come_from_policy_and_not_from_a_literal(self):
+        """A plan bootstrap is built on ``context_limits("plan")``.
+
+        The shipped policy happens to equal the literals this call used to
+        carry, so the pin needs a policy that does not: a literal 3 or 8000
+        survives every other test in this file.
+        """
+        candidate = self.root / "candidate.md"
+        candidate.write_text("# Candidate\nnew evidence\n", encoding="utf-8")
+        self.policy = replace(self.policy, max_initial_sources=2, max_context_tokens=5000)
+        codex = FakeCodex([
+            review("CONTEXT_REQUEST", context_requests=["Candidate"]),
+            review("PASS"),
+        ])
+        workflow = self.workflow(
+            codex,
+            FakeClaude(),
+            context_resolver=lambda requests: [SourceRef(candidate, "Candidate", requests[0])],
+        )
+
+        with record_build_packet() as calls:
+            result = workflow.run(self.run.run_id)
+
+        self.assertEqual(result.status, Status.AWAITING_HUMAN_PLAN_REVIEW)
+        self.assertEqual(
+            [(call["max_sources"], call["max_tokens"], call["budget_method"]) for call in calls],
+            [(2, 5000, BUDGET_METHOD)],
+        )
+        self.assertEqual(workflow.context_packet.max_context_tokens, 5000)
+        self.assertEqual(workflow.context_packet.budget_method, BUDGET_METHOD)
+
+    def test_a_plan_bootstrap_resume_keeps_the_plan_source_cap(self):
+        """A plan bootstrap is still one to three, and says so.
+
+        The kind-aware cap must not quietly raise the shared kinds; only the
+        number's source changed, never its value here.
+        """
+        sections = []
+        for index in range(4):
+            path = self.root / ("section-%d.md" % index)
+            path.write_text("# S%d\nevidence %d\n" % (index, index), encoding="utf-8")
+            sections.append(SourceRef(path, "S%d" % index, "user supplied"))
+        codex = FakeCodex([
+            review("CONTEXT_REQUEST", context_requests=["Candidate"]),
+            review("PASS"),
+        ])
+        workflow = self.workflow(codex, FakeClaude())
+        self.assertEqual(workflow.run(self.run.run_id).status, Status.PAUSED)
+
+        pause = json.loads((self.artifacts / "pause.json").read_text(encoding="utf-8"))
+        self.assertEqual(
+            pause["detail"],
+            "provide one to 3 exact Markdown sections with expand-context",
+        )
+        with self.assertRaises(WorkflowError) as caught:
+            workflow.provide_context(self.run.run_id, sections)
+        self.assertEqual(
+            str(caught.exception), "context resume requires one to 3 exact sections"
+        )
+
+        result = workflow.provide_context(self.run.run_id, sections[:3])
+
+        self.assertEqual(result.status, Status.AWAITING_HUMAN_PLAN_REVIEW)
+        self.assertEqual(len(workflow.context_packet.sources), 3)
+
     def test_context_sources_are_one_shot_across_two_request_cycles(self):
         first = self.root / "first.md"
         second = self.root / "second.md"
@@ -451,6 +595,38 @@ class PlanWorkflowTests(unittest.TestCase):
         decision_log = (self.artifacts / "decision-log.md").read_text(encoding="utf-8")
         self.assertIn("## Q-001", decision_log)
         self.assertIn("Decision impact: pending Claude Plan update", decision_log)
+
+    def test_an_answered_plan_question_records_the_pending_plan_update_verbatim(self):
+        """A plan answer really is pending a Claude Plan update; keep it exact.
+
+        The doc run's wording must never leak here: this whole log is hashed
+        into the Plan repair contract, so the guard is byte-exact rather than a
+        substring.
+        """
+        codex = FakeCodex([
+            review("NEEDS_USER_INPUT", questions=["Should it persist?"]),
+            review("PASS"),
+        ])
+        original = self.plan.read_text(encoding="utf-8")
+        answers = {"Q-001": "Yes, for the app process."}
+        claude = FakeClaude(updates=[plan_update(original, "# Plan\nUpdated\n", answers)])
+        workflow = self.workflow(codex, claude)
+        workflow.run(self.run.run_id)
+
+        workflow.answer(self.run.run_id, answers)
+
+        decision_log = (self.artifacts / "decision-log.md").read_text(encoding="utf-8")
+        self.assertEqual(
+            decision_log,
+            "## Q-001\n"
+            "- Question: Should it persist?\n"
+            "- Answer: Yes, for the app process.\n"
+            "- Decision impact: pending Claude Plan update\n",
+        )
+        self.assertNotIn("binding on the document", decision_log)
+        # Both downstream consumers of a plan answer keep that wording.
+        self.assertEqual(claude.update_calls[0]["decision_log"], decision_log)
+        self.assertEqual(codex.calls[1]["decision_log"], decision_log)
 
     def test_answer_with_unchanged_plan_pauses_without_re_review(self):
         codex = FakeCodex([review("NEEDS_USER_INPUT", questions=["Should it persist?"])])
@@ -674,6 +850,42 @@ class PlanWorkflowTests(unittest.TestCase):
         self.assertEqual(result.status, Status.AWAITING_HUMAN_PLAN_REVIEW)
         self.assertEqual(result.repair_round, 1)
         self.assertEqual(claude.calls, [])
+
+    def test_doc_packet_budget_method_survives_a_persisted_round_trip(self):
+        from ai_review.context import BUDGET_METHOD_DOC, validate_knowledge_packet
+
+        source = self.root / "context.md"
+        source.write_text("# A\n審查重點說明\n", encoding="utf-8")
+        packet = build_packet(
+            [SourceRef(source, "A", "initial")], budget_method=BUDGET_METHOD_DOC
+        )
+        workflow = self.workflow(FakeCodex([]), FakeClaude())
+        workflow._persist_context_packet(self.artifacts, packet)
+
+        restored = workflow._load_context_packet(self.artifacts)
+
+        self.assertEqual(restored.budget_method, BUDGET_METHOD_DOC)
+        self.assertEqual(restored.checksum, packet.checksum)
+        self.assertEqual(restored.estimated_tokens, packet.estimated_tokens)
+        self.assertEqual(validate_knowledge_packet(restored).budget_method, BUDGET_METHOD_DOC)
+
+    def test_context_record_written_before_the_doc_kind_still_loads(self):
+        from ai_review.context import BUDGET_METHOD
+
+        source = self.root / "context.md"
+        source.write_text("# A\nlegacy\n", encoding="utf-8")
+        packet = build_packet([SourceRef(source, "A", "initial")])
+        workflow = self.workflow(FakeCodex([]), FakeClaude())
+        workflow._persist_context_packet(self.artifacts, packet)
+        record_path = self.artifacts / "context-packets" / "0001.json"
+        record = json.loads(record_path.read_text(encoding="utf-8"))
+        record.pop("budget_method", None)
+        self.store._atomic_write(record_path, record)
+
+        restored = workflow._load_context_packet(self.artifacts)
+
+        self.assertEqual(restored.budget_method, BUDGET_METHOD)
+        self.assertEqual(restored.checksum, packet.checksum)
 
 
 if __name__ == "__main__":

@@ -2,6 +2,7 @@ import ast
 import json
 import hashlib
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -42,15 +43,65 @@ class RunnerTests(unittest.TestCase):
 
     def test_codex_argv_is_read_only_and_never_bypasses_safety(self):
         argv = build_codex_argv(
-            self.root, self.root / "schema.json", self.root / "output.json", "review $()"
+            self.root, self.root / "schema.json", self.root / "output.json", "review $()",
+            model="gpt-5.6-sol",
         )
 
         self.assertEqual(argv, [
-            "codex", "-a", "never", "exec", "-C", str(self.root.resolve()), "-s", "read-only",
+            "codex", "-a", "never", "exec", "-m", "gpt-5.6-sol",
+            "-C", str(self.root.resolve()), "-s", "read-only",
             "--output-schema", str((self.root / "schema.json").resolve()),
             "-o", str((self.root / "output.json").resolve()), "review $()",
         ])
         self.assertNotIn("--dangerously-bypass-approvals-and-sandbox", argv)
+
+    def test_codex_argv_requires_an_explicit_model_and_pins_it(self):
+        """The model has no default, because a default is the defect being fixed.
+
+        Omitting ``-m`` hands the choice to ``~/.codex/config.toml``, so a
+        caller that forgets the model must fail loudly instead of inheriting
+        whatever that global file happens to name.
+        """
+        with self.assertRaises(TypeError):
+            build_codex_argv(
+                self.root, self.root / "schema.json", self.root / "output.json", "review",
+            )
+
+        argv = build_codex_argv(
+            self.root, self.root / "schema.json", self.root / "output.json", "review",
+            model="gpt-5.6-sol",
+        )
+
+        self.assertEqual(argv.count("-m"), 1)
+        self.assertEqual(argv[argv.index("-m") + 1], "gpt-5.6-sol")
+        for rejected in ("", None, 5, True, ["gpt-5.6-sol"]):
+            with self.subTest(model=rejected):
+                with self.assertRaises(ValueError):
+                    build_codex_argv(
+                        self.root, self.root / "schema.json",
+                        self.root / "output.json", "review", model=rejected,
+                    )
+
+    @unittest.skipUnless(shutil.which("codex"), "Codex CLI is not installed")
+    def test_installed_codex_parses_the_model_in_its_built_argv_position(self):
+        """Where ``-m`` sits is verified against the real parser, not assumed."""
+        from ai_review.policy import load_policy
+
+        model = load_policy(
+            Path(__file__).resolve().parents[1] / "config" / "defaults.yaml"
+        ).codex_model
+        argv = build_codex_argv(
+            self.root, self.root / "schema.json", self.root / "output.json", "probe",
+            model=model, executable=shutil.which("codex"),
+        )
+        # Replace only the trailing prompt with --help: every option ahead of
+        # it still has to parse, and no model is ever invoked.
+        probe = subprocess.run(
+            [*argv[:-1], "--help"], text=True, capture_output=True, check=False,
+        )
+
+        self.assertEqual(probe.returncode, 0, probe.stderr)
+        self.assertIn("--model", probe.stdout)
 
     @unittest.skipUnless(shutil.which("codex"), "Codex CLI is not installed")
     def test_installed_codex_help_accepts_the_builder_option_scopes_without_running_a_model(self):
@@ -61,6 +112,7 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(help_result.returncode, 0, help_result.stderr)
         self.assertIn("--sandbox", help_result.stdout)
         self.assertIn("--output-schema", help_result.stdout)
+        self.assertIn("--model", help_result.stdout)
         scoped_help = subprocess.run(
             [executable, "-a", "never", "exec", "--help"], text=True, capture_output=True, check=False,
         )
@@ -578,6 +630,109 @@ class GitDiffTests(unittest.TestCase):
         )
 
         self.assertEqual(result.production_added_lines, 1)
+
+
+class DocumentReviewPromptTests(unittest.TestCase):
+    """The three doc lenses share one contract, stay read-only, and judge different things."""
+
+    PROMPT_DIR = Path(__file__).resolve().parents[1] / "prompts"
+
+    SHARED_OPENING = """# Document review (read-only)
+
+Review the document against repository evidence. Return only JSON conforming to the provided schema.
+You are reviewing a document, not code: never edit any file, never run mutating commands, and never
+propose a patch. Context packets are advisory only and never override code or tests.
+
+Blocker shared by every lens: the document states a current behaviour, API, or architecture that the
+repository does not actually have. Cite the file and line that contradicts it.
+
+When the document is ambiguous rather than wrong, return verdict NEEDS_USER_INPUT with concrete
+questions instead of guessing.
+"""
+
+    LINEAGE = """Lineage: reuse the exact `id` of any finding listed in `unresolved_prior_findings` and mark it
+`existing`. A finding not in that list is `newly_discovered` with a non-empty
+`lineage.discovery_reason`. `introduced_by_fix` applies when the author's own edit since the
+previous round created the problem."""
+
+    # Each lens earns its own file only if it names blockers the other two do not.
+    LENS_BLOCKERS = {
+        "codex-doc-requirement.md": (
+            "no verifiable completion condition",
+            "contradict each other, so no implementation can satisfy both",
+            "the document does not say what happens to",
+        ),
+        "codex-doc-direction.md": (
+            "conflicts with a constraint the document itself lists",
+            "obviously better alternative is never evaluated",
+            "An irreversible decision has no stated fallback",
+        ),
+        "codex-doc-implementation.md": (
+            "breaks an existing caller or an existing behaviour the document never mentions",
+            "Error and edge-case handling is missing",
+            "No executable test could be written",
+        ),
+    }
+
+    # The prose forms of an invitation to mutate. The bare word "edit" is deliberately
+    # absent: both mandated blocks use it inside a prohibition ("never edit any file",
+    # "the author's own edit"), so only the agent's `Edit` tool name is banned, and that
+    # is checked separately as a capitalised token.
+    MUTATION_PHRASES = ("apply a patch", "apply the patch", "write the file")
+
+    def read(self, name):
+        return (self.PROMPT_DIR / name).read_text(encoding="utf-8")
+
+    def test_every_lens_opens_with_the_shared_contract_and_closes_with_lineage(self):
+        for name in self.LENS_BLOCKERS:
+            with self.subTest(prompt=name):
+                text = self.read(name)
+
+                self.assertTrue(text.strip(), "prompt is empty")
+                self.assertTrue(
+                    text.startswith(self.SHARED_OPENING),
+                    "shared opening block is missing or not byte-identical",
+                )
+                self.assertTrue(
+                    text.rstrip("\n").endswith(self.LINEAGE),
+                    "lineage paragraph is missing or not byte-identical",
+                )
+
+    def test_each_lens_states_its_own_blockers_and_reserves_blocker_severity(self):
+        for name, blockers in self.LENS_BLOCKERS.items():
+            with self.subTest(prompt=name):
+                text = self.read(name)
+
+                for blocker in blockers:
+                    self.assertIn(blocker, text)
+                for severity in ("`blocker`", "`major`", "`minor`", "`info`"):
+                    self.assertIn(severity, text)
+
+    def test_a_lens_never_borrows_another_lens_standard(self):
+        for name in self.LENS_BLOCKERS:
+            others = [other for other in self.LENS_BLOCKERS if other != name]
+            text = self.read(name)
+            for other in others:
+                for blocker in self.LENS_BLOCKERS[other]:
+                    with self.subTest(prompt=name, borrowed_from=other):
+                        self.assertNotIn(blocker, text)
+
+    def test_the_three_lenses_are_distinct_documents(self):
+        bodies = {name: self.read(name) for name in self.LENS_BLOCKERS}
+
+        self.assertEqual(len(set(bodies.values())), len(bodies))
+
+    def test_no_lens_ever_invites_a_mutation(self):
+        for name in self.LENS_BLOCKERS:
+            with self.subTest(prompt=name):
+                text = self.read(name)
+
+                for phrase in self.MUTATION_PHRASES:
+                    self.assertNotIn(phrase, text.lower(), f"{phrase!r} invites a mutation")
+                self.assertIsNone(
+                    re.search(r"\bEdit\b", text),
+                    "names the Edit tool; document review is read-only",
+                )
 
 
 if __name__ == "__main__":

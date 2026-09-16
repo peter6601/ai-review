@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Optional
 
 from .context import (
-    ContextExpansionError, KnowledgePacket, SourceExcerpt, SourceRef,
+    BUDGET_METHOD, ContextExpansionError, KnowledgePacket, SourceExcerpt, SourceRef,
     build_packet, expand_packet, validate_knowledge_packet,
 )
 from .models import RunState, Status, Verdict, canonical_answer_submission, canonical_user_question_ids
@@ -88,6 +88,29 @@ class PlanWorkflow:
     safety and structured-output validation boundaries.
     """
 
+    # Statuses that mean the loop has already stopped at a gate.  A subclass
+    # whose run ends somewhere else adds that status here rather than copying
+    # ``run``.
+    _HALT_STATUSES = (
+        Status.AWAITING_HUMAN_PLAN_REVIEW,
+        Status.AWAITING_USER_INPUT,
+        Status.PAUSED,
+        Status.INTERRUPTED,
+    )
+
+    # How many replacement candidates a human may offer for one expansion.
+    # This is not an initial-source cap and does not come from
+    # ``context_limits``: ``expand_packet`` swaps exactly one excerpt, so this
+    # bounds the alternatives offered, never how large the packet becomes.
+    _MAX_EXPANSION_CANDIDATES = 3
+
+    # What an answered question does next, written into ``decision-log.md`` and
+    # read by the next Codex round.  It belongs to the subclass because it is a
+    # claim about that kind's own loop: a plan or code answer really is waiting
+    # on Claude, and a kind whose answers are followed by something else says so
+    # here rather than reimplementing ``_append_decisions``.
+    _DECISION_IMPACT = "pending Claude Plan update"
+
     def __init__(
         self,
         store: RunStore,
@@ -114,12 +137,7 @@ class PlanWorkflow:
         state = self.store.load(run_id)
         try:
             self._validate_state(state)
-            if state.status in (
-                Status.AWAITING_HUMAN_PLAN_REVIEW,
-                Status.AWAITING_USER_INPUT,
-                Status.PAUSED,
-                Status.INTERRUPTED,
-            ):
+            if state.status in self._HALT_STATUSES:
                 return state
             self._set_running(state)
             self.store.save(state)
@@ -171,8 +189,9 @@ class PlanWorkflow:
         ):
             raise WorkflowError("pending context request is stale or unbound")
         selected = tuple(sources)
-        if not selected or len(selected) > 3:
-            raise WorkflowError("context resume requires one to three exact sections")
+        limit = self._resume_source_limit(state, artifacts)
+        if not selected or len(selected) > limit:
+            raise WorkflowError("context resume requires one to %d exact sections" % limit)
         def one_shot(actual_requests: Iterable[str]) -> tuple[SourceRef, ...]:
             if tuple(actual_requests) != tuple(requests):
                 raise WorkflowError("context sources do not match the pending request")
@@ -451,6 +470,37 @@ class PlanWorkflow:
         )
         self.store.save(state)
 
+    def _context_limits(self, state: RunState) -> tuple[int, int, str]:
+        """(max_sources, max_tokens, budget_method) for this run's kind.
+
+        Resolved from the run state rather than from a class constant so that
+        one workflow class driving several kinds still bootstraps each one on
+        its own budget.  A subclass whose packets are measured differently
+        overrides only the estimator; the two caps stay the policy's.
+        """
+        max_sources, max_tokens = self.policy.context_limits(state.kind)
+        return max_sources, max_tokens, BUDGET_METHOD
+
+    def _resume_source_limit(self, state: RunState, artifacts: Path) -> int:
+        """How many exact sections a human may supply for a pending request.
+
+        The two resume paths bound different things.  With no packet yet, the
+        sections supplied *are* the run's initial sources, so the kind's own
+        cap applies and a doc run may use all five policy grants it.  With a
+        packet already in hand the sections are replacement candidates for a
+        single-excerpt swap, which is a different limit entirely.
+
+        The condition mirrors how ``_expand_context`` chooses its branch, plus
+        the packet ``_ensure_context_reference`` is about to persist, so the
+        number quoted to a human matches the path their resume will take.
+        """
+        if (
+            self.store.artifact_exists(artifacts / "context-reference.json")
+            or self.context_packet is not None
+        ):
+            return self._MAX_EXPANSION_CANDIDATES
+        return self._context_limits(state)[0]
+
     def _expand_context(
         self, state: RunState, artifacts: Path, sequence: int, requests: Iterable[str]
     ) -> None:
@@ -470,7 +520,8 @@ class PlanWorkflow:
             )
             self._pause(
                 state, artifacts, "CONTEXT_INPUT_REQUIRED",
-                "provide one to three exact Markdown sections with expand-context",
+                "provide one to %d exact Markdown sections with expand-context"
+                % self._resume_source_limit(state, artifacts),
             )
             return
         try:
@@ -488,10 +539,12 @@ class PlanWorkflow:
             else:
                 candidates = tuple(self.context_resolver(tuple(requests)))
                 if not self.store.artifact_exists(artifacts / "context-reference.json"):
+                    max_sources, max_tokens, budget_method = self._context_limits(state)
                     packet = build_packet(
                         candidates,
-                        max_sources=3,
-                        max_tokens=self.policy.max_context_tokens,
+                        max_sources=max_sources,
+                        max_tokens=max_tokens,
+                        budget_method=budget_method,
                     )
                     intent = {
                         "status": "complete",
@@ -638,6 +691,7 @@ class PlanWorkflow:
             "markdown": packet.markdown,
             "revision": packet.revision,
             "expansion_count": packet.expansion_count,
+            "budget_method": packet.budget_method,
             "advisory_only": True,
         }
 
@@ -647,7 +701,12 @@ class PlanWorkflow:
             "sources", "checked_not_selected", "max_context_tokens", "estimated_tokens", "checksum",
             "markdown", "revision", "expansion_count", "advisory_only",
         }
-        if not isinstance(record, dict) or set(record) != required or record["advisory_only"] is not True:
+        # budget_method is optional: records written before the doc kind lack it.
+        if (
+            not isinstance(record, dict)
+            or set(record) - {"budget_method"} != required
+            or record["advisory_only"] is not True
+        ):
             raise WorkflowError("persisted context packet is invalid")
         try:
             sources = tuple(SourceExcerpt(**source) for source in record["sources"])
@@ -660,6 +719,7 @@ class PlanWorkflow:
                 markdown=record["markdown"],
                 revision=record["revision"],
                 expansion_count=record["expansion_count"],
+                budget_method=record.get("budget_method", BUDGET_METHOD),
                 # Workflow persists run context exclusively through RunStore;
                 # passing an artifact pathname to context.expand_packet would
                 # reintroduce untrusted Path-based run-artifact writes.
@@ -858,7 +918,7 @@ class PlanWorkflow:
                 "## %s" % item["id"],
                 "- Question: %s" % item["question"],
                 "- Answer: %s" % answers[item["id"]],
-                "- Decision impact: pending Claude Plan update",
+                "- Decision impact: %s" % self._DECISION_IMPACT,
                 "",
             ])
         if additions:

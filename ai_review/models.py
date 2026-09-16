@@ -8,7 +8,7 @@ import re
 import secrets
 import stat
 import subprocess
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
@@ -38,6 +38,7 @@ class Status(str, Enum):
     AWAITING_USER_INPUT = "AWAITING_USER_INPUT"
     AWAITING_HUMAN_PLAN_REVIEW = "AWAITING_HUMAN_PLAN_REVIEW"
     AWAITING_HUMAN_CODE_REVIEW = "AWAITING_HUMAN_CODE_REVIEW"
+    AWAITING_HUMAN_DOC_REVIEW = "AWAITING_HUMAN_DOC_REVIEW"
     AWAITING_REVIEW_APPROVAL = "AWAITING_REVIEW_APPROVAL"
     AWAITING_PREFLIGHT = "AWAITING_PREFLIGHT"
     PAUSED = "PAUSED"
@@ -474,6 +475,115 @@ class ReviewManifest:
         }
         if set(value) != expected:
             raise ValueError("review manifest fields are invalid")
+        return cls(**value)
+
+
+DOC_LENSES = ("requirement", "direction", "implementation")
+
+
+@dataclass(frozen=True)
+class DocManifest:
+    """Canonical inputs for one read-only document review.
+
+    A doc run is one Codex pass whose findings a human reads: nothing
+    downstream inherits it, so it binds no verification commands and never
+    reaches an approval gate.  What it does bind is the lens it was judged by
+    and the reason that lens was chosen, so the standard applied to a document
+    stays auditable after the fact.
+    """
+
+    kind: str
+    repo_path: str
+    doc_path: str
+    base_ref: str
+    base_oid: str
+    lens: str
+    lens_reason: str
+    brief: str
+    brief_digest: str
+    doc_digest: str
+    knowledge_sources: Iterable[str] = field(default_factory=tuple)
+    context_checksum: Optional[str] = None
+    review_executables: Mapping[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if self.kind != "doc":
+            raise ValueError("doc manifest kind must be doc")
+        if not isinstance(self.base_ref, str) or not self.base_ref:
+            raise ValueError("base_ref must be a non-empty string")
+        if self.lens not in DOC_LENSES:
+            raise ValueError("doc lens must be requirement, direction, or implementation")
+        if not isinstance(self.lens_reason, str):
+            raise ValueError("doc lens reason must be text")
+        normalized_reason = self.lens_reason.strip()
+        if not normalized_reason or len(normalized_reason.encode("utf-8")) > 500:
+            raise ValueError("doc lens reason must be non-empty and at most 500 UTF-8 bytes")
+        if not isinstance(self.brief, str):
+            raise ValueError("doc brief must be text")
+        normalized_brief = self.brief.strip()
+        if not normalized_brief or len(normalized_brief.encode("utf-8")) > 2_000:
+            raise ValueError("doc brief must be non-empty and at most 2,000 UTF-8 bytes")
+        expected_brief_digest = hashlib.sha256(normalized_brief.encode("utf-8")).hexdigest()
+        if self.brief_digest != expected_brief_digest:
+            raise ValueError("doc brief digest does not match the normalized brief")
+        if not re.fullmatch(r"[0-9a-f]{64}", self.doc_digest):
+            raise ValueError("doc digest must be SHA-256 hex")
+        if not re.fullmatch(r"[0-9a-f]{40}(?:[0-9a-f]{24})?", self.base_oid):
+            raise ValueError("base_oid must be a full commit object ID")
+        if self.context_checksum is not None and not re.fullmatch(
+            r"[0-9a-f]{64}", self.context_checksum
+        ):
+            raise ValueError("context_checksum must be SHA-256 hex")
+
+        sources = tuple(_canonical_path(source) for source in self.knowledge_sources)
+        identities = dict(self.review_executables)
+        # Empty binds nothing, as in RunManifest; non-empty must bind both
+        # Codex and Claude.  Doc runs only ever invoke Codex, but the identity
+        # rule stays whole so a later change cannot quietly drop it.
+        if identities and set(identities) != {"codex", "claude"}:
+            raise ValueError("review executable identities must bind Codex and Claude")
+        for identity in identities.values():
+            validate_executable_identity(identity)
+
+        object.__setattr__(self, "repo_path", _canonical_path(self.repo_path))
+        object.__setattr__(self, "doc_path", _canonical_path(self.doc_path))
+        object.__setattr__(self, "lens_reason", normalized_reason)
+        object.__setattr__(self, "brief", normalized_brief)
+        object.__setattr__(self, "knowledge_sources", sources)
+        object.__setattr__(self, "review_executables", identities)
+
+    def to_dict(self) -> dict:
+        return {
+            "kind": self.kind,
+            "repo_path": self.repo_path,
+            "doc_path": self.doc_path,
+            "base_ref": self.base_ref,
+            "base_oid": self.base_oid,
+            "lens": self.lens,
+            "lens_reason": self.lens_reason,
+            "brief": self.brief,
+            "brief_digest": self.brief_digest,
+            "doc_digest": self.doc_digest,
+            "knowledge_sources": list(self.knowledge_sources),
+            "context_checksum": self.context_checksum,
+            "review_executables": self.review_executables,
+        }
+
+    def digest(self) -> str:
+        payload = json.dumps(self.to_dict(), sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    @classmethod
+    def from_dict(cls, value: dict) -> "DocManifest":
+        if not isinstance(value, dict):
+            raise ValueError("doc manifest must be an object")
+        expected = {
+            "kind", "repo_path", "doc_path", "base_ref", "base_oid", "lens",
+            "lens_reason", "brief", "brief_digest", "doc_digest",
+            "knowledge_sources", "context_checksum", "review_executables",
+        }
+        if set(value) != expected:
+            raise ValueError("doc manifest fields are invalid")
         return cls(**value)
 
 
@@ -1002,12 +1112,13 @@ def verify_risk_approval(
 
 _CODE_FACTORY_TOKEN = object()
 _REVIEW_FACTORY_TOKEN = object()
+_DOC_FACTORY_TOKEN = object()
 
 
 @dataclass(frozen=True)
 class RunState:
     kind: str
-    manifest: Optional[Union[RunManifest, ReviewManifest]] = None
+    manifest: Optional[Union[RunManifest, ReviewManifest, DocManifest]] = None
     run_id: Optional[str] = None
     status: Status = Status.READY
     repair_round: int = 0
@@ -1016,10 +1127,11 @@ class RunState:
     updated_at: str = field(default_factory=_utc_now)
     _code_factory_token: Any = field(default=None, repr=False, compare=False)
     _review_factory_token: Any = field(default=None, repr=False, compare=False)
+    _doc_factory_token: Any = field(default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:
-        if self.kind not in ("plan", "code", "review"):
-            raise ValueError("run kind must be plan, code, or review")
+        if self.kind not in ("plan", "code", "review", "doc"):
+            raise ValueError("run kind must be plan, code, review, or doc")
         if self.kind == "plan" and self.manifest is not None and (
             not isinstance(self.manifest, RunManifest) or self.manifest.kind != "plan"
         ):
@@ -1038,6 +1150,13 @@ class RunState:
                 self.approval_attestation, ReviewApprovalAttestation
             ):
                 raise ValueError("Review state cannot carry a Plan approval attestation")
+        if self.kind == "doc":
+            if self._doc_factory_token is not _DOC_FACTORY_TOKEN:
+                raise ValueError("Doc state must be created with new_doc")
+            if not isinstance(self.manifest, DocManifest):
+                raise ValueError("Doc state requires a doc manifest")
+            if self.approval_attestation is not None:
+                raise ValueError("a doc review is never approved and carries no attestation")
 
     @property
     def plan_path(self) -> str:
@@ -1106,6 +1225,18 @@ class RunState:
         )
 
     @classmethod
+    def new_doc(cls, manifest: DocManifest) -> "RunState":
+        """Start a doc run ready to review; no approval gates a read-only pass."""
+        if not isinstance(manifest, DocManifest):
+            raise ValueError("Doc initialization requires a doc manifest")
+        return cls(
+            kind="doc",
+            manifest=manifest,
+            status=Status.READY,
+            _doc_factory_token=_DOC_FACTORY_TOKEN,
+        )
+
+    @classmethod
     def new_code_from_approved_plan(
         cls, plan_run: "RunState", authority: ApprovalAuthority
     ) -> "RunState":
@@ -1145,9 +1276,15 @@ class RunState:
     def transition(self, verdict: Verdict, max_rounds: int = 6) -> None:
         if not isinstance(verdict, Verdict):
             verdict = Verdict(verdict)
+        if self.kind == "doc":
+            # A doc review has no repair loop and no Code review to reach, so
+            # every verdict status here would be a lie; end it with
+            # complete_doc_review instead.
+            raise ValueError("a doc run ends with complete_doc_review, not a verdict")
         if self.status in (
             Status.AWAITING_HUMAN_PLAN_REVIEW,
             Status.AWAITING_HUMAN_CODE_REVIEW,
+            Status.AWAITING_HUMAN_DOC_REVIEW,
             Status.AWAITING_REVIEW_APPROVAL,
         ):
             raise ValueError("human review requires an explicit approval command")
@@ -1200,6 +1337,49 @@ class RunState:
         object.__setattr__(self, "status", Status.READY)
         object.__setattr__(self, "updated_at", attestation.approved_at)
 
+    def complete_doc_review(self) -> None:
+        """Hand one finished doc review to its human reader.
+
+        Nothing downstream inherits a doc review, so this is the end of the
+        run rather than a gate: there is no approval to collect afterwards.
+        """
+        if self.kind != "doc":
+            raise ValueError("only a doc run can complete a doc review")
+        if self.status not in (Status.READY, Status.RUNNING):
+            raise ValueError("only a running doc review can be completed")
+        object.__setattr__(self, "status", Status.AWAITING_HUMAN_DOC_REVIEW)
+        object.__setattr__(self, "updated_at", _utc_now())
+
+    def rebind_document(self, new_digest: str) -> None:
+        """Point a finished doc review at the document's new bytes, for one more round.
+
+        The human loop is: read the findings, edit the document, ask again.
+        Only the document moves.  The lens, the reason it was chosen, the
+        brief, the frozen base and the evidence packet all stay exactly as they
+        were, because the second round is the same review of a changed
+        document, not a different review — and ``repair_round`` stays 0,
+        because a human editing their own document is not a repair loop.
+
+        This lives on the state rather than on the workflow for the same reason
+        ``complete_doc_review`` does: the manifest is frozen, so rebinding it
+        anywhere else would mean reaching in with ``object.__setattr__``.
+        """
+        if self.kind != "doc" or not isinstance(self.manifest, DocManifest):
+            raise ValueError("only a doc run can be rebound to a document")
+        if self.status != Status.AWAITING_HUMAN_DOC_REVIEW:
+            raise ValueError("only a doc review awaiting its reader can be re-reviewed")
+        # The hex rule itself stays single-sourced in DocManifest; only the
+        # type is checked here, so this API never raises TypeError from three
+        # frames down for a caller that passed nothing at all.
+        if not isinstance(new_digest, str):
+            raise ValueError("document digest must be SHA-256 hex")
+        # Build the new manifest before anything is mutated, so a malformed
+        # digest leaves a finished run exactly as its reader left it.
+        rebound = replace(self.manifest, doc_digest=new_digest)
+        object.__setattr__(self, "manifest", rebound)
+        object.__setattr__(self, "status", Status.RUNNING)
+        object.__setattr__(self, "updated_at", _utc_now())
+
     def validate(self, authority: Optional[ApprovalAuthority], *, verify_attestation: bool = True) -> None:
         if type(self.repair_round) is not int or self.repair_round < 0:
             raise ValueError("repair_round must be a non-negative integer")
@@ -1241,6 +1421,13 @@ class RunState:
                     authority is None or not authority.verifies(self.approval_attestation)
                 ):
                     raise ValueError("review approval attestation signature is invalid")
+        if self.kind == "doc":
+            if not isinstance(self.manifest, DocManifest):
+                raise ValueError("Doc state requires a doc manifest")
+            if self.approval_attestation is not None:
+                raise ValueError("a doc review is never approved and carries no attestation")
+            if self.repair_round != 0:
+                raise ValueError("a doc review has no repair loop and no repair rounds")
         if self.kind == "code":
             if self.approval_attestation is None:
                 raise ValueError("Code state requires a human Plan approval")
@@ -1298,7 +1485,14 @@ class RunState:
         manifest_value = value.get("manifest")
         attestation_value = value.get("approval_attestation")
         kind = value["kind"]
-        if kind == "review":
+        if kind == "doc":
+            manifest = DocManifest.from_dict(manifest_value) if manifest_value else None
+            if attestation_value is not None:
+                # On disk this can only be tampering or a bug.  Dropping it
+                # would leave an unapproved run and no signal at all.
+                raise ValueError("a persisted doc run cannot carry an approval attestation")
+            attestation = None
+        elif kind == "review":
             manifest = ReviewManifest.from_dict(manifest_value) if manifest_value else None
             attestation = (
                 ReviewApprovalAttestation.from_dict(attestation_value)
@@ -1320,6 +1514,7 @@ class RunState:
             updated_at=value["updated_at"],
             _code_factory_token=_CODE_FACTORY_TOKEN if kind == "code" else None,
             _review_factory_token=_REVIEW_FACTORY_TOKEN if kind == "review" else None,
+            _doc_factory_token=_DOC_FACTORY_TOKEN if kind == "doc" else None,
         )
         if value.get("human_approved_at") != state.human_approved_at:
             raise ValueError("human approval timestamp does not match its attestation")

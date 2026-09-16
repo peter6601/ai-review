@@ -490,5 +490,231 @@ class ReviewSummaryTests(unittest.TestCase):
         self.assertEqual(result.candidate_triggers, ())
 
 
+class DocSummaryTests(unittest.TestCase):
+    """A doc summary renders one read-only pass, and nothing a doc run lacks.
+
+    Every artifact here is produced by the real ``DocWorkflow``, so what the
+    summary claims is exactly what a run leaves behind.
+    """
+
+    def setUp(self):
+        import hashlib
+
+        from ai_review.models import DocManifest
+
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.repo = self.root / "repo"
+        (self.repo / "docs").mkdir(parents=True)
+        subprocess.run(["git", "init", "-q", str(self.repo)], check=True)
+        self.document = self.repo / "docs" / "rd-spec.md"
+        self.document.write_text("# 離線編輯\n\n使用者可以在離線時編輯內容。\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(self.repo), "add", "."], check=True)
+        subprocess.run([
+            "git", "-C", str(self.repo), "-c", "user.email=test@example.com",
+            "-c", "user.name=Test", "commit", "-qm", "base",
+        ], check=True)
+        self.base_oid = subprocess.run(
+            ["git", "-C", str(self.repo), "rev-parse", "HEAD"],
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        self.brief = "離線編輯的 RD spec，給 PM 與 QA 讀"
+        self.lens_reason = "文件只描述使用者行為，沒有任何檔案路徑"
+        self.store = RunStore(self.root / "runs")
+        self.run = self.store.create(RunState.new_doc(self.manifest()))
+
+    def manifest(self):
+        import hashlib
+
+        from ai_review.models import DocManifest
+
+        return DocManifest(
+            kind="doc", repo_path=str(self.repo), doc_path=str(self.document),
+            base_ref="HEAD", base_oid=self.base_oid, lens="requirement",
+            lens_reason=self.lens_reason, brief=self.brief,
+            brief_digest=hashlib.sha256(self.brief.encode("utf-8")).hexdigest(),
+            doc_digest=hashlib.sha256(self.document.read_bytes()).hexdigest(),
+        )
+
+    def output_text(self, path):
+        return self.store.read_artifact_bytes(path).decode("utf-8")
+
+    def doc_finding(self, identifier, severity="blocker"):
+        return {
+            "id": identifier,
+            "severity": severity,
+            "invariant": "every scenario states its completion condition",
+            "location": "docs/rd-spec.md:3",
+            "evidence": "the scenario states no observable result",
+            "required_outcome": "state what proves the scenario finished",
+            "lineage": {
+                "resolution": "newly_discovered",
+                "discovery_reason": "first pass over this document",
+            },
+        }
+
+    def doc_review(self, verdict, *, findings=(), questions=()):
+        return {
+            "verdict": verdict, "summary": "document review result",
+            "findings": list(findings), "questions": list(questions),
+            "context_requests": [],
+        }
+
+    def review_round(self, *responses, run_id=None):
+        """Drive the real doc workflow through one round per response."""
+        from ai_review.doc_workflow import DocWorkflow
+
+        class FakeCodex:
+            def __init__(self, queued):
+                self.queued = list(queued)
+
+            def review(self, _inputs):
+                return self.queued.pop(0)
+
+        run_id = run_id or self.run.run_id
+        for response in responses:
+            state = self.store.load(run_id)
+            if state.status == Status.AWAITING_HUMAN_DOC_REVIEW:
+                object.__setattr__(state, "status", Status.RUNNING)
+                self.store.save(state)
+            DocWorkflow(self.store, FakeCodex([response]), None).run(run_id)
+        return self.store.load(run_id)
+
+    def test_a_doc_summary_names_the_lens_the_verdict_and_every_finding(self):
+        state = self.review_round(self.doc_review("CHANGES_REQUIRED", findings=[
+            self.doc_finding("D1", "blocker"), self.doc_finding("D2", "minor"),
+        ]))
+        self.assertEqual(state.status, Status.AWAITING_HUMAN_DOC_REVIEW)
+
+        result = generate_outputs(self.store, self.run.run_id)
+
+        text = self.output_text(result.final_summary)
+        self.assertIn("requirement", text)
+        self.assertIn(self.lens_reason, text)
+        self.assertIn(self.brief, text)
+        self.assertIn("CHANGES_REQUIRED", text)
+        self.assertIn("D1", text)
+        self.assertIn("D2", text)
+        self.assertIn("blocker", text)
+        self.assertIn("minor", text)
+        # The report beside the document is where the human reads the detail.
+        self.assertIn("docs/rd-spec-review-01.md", text)
+        # A Codex PASS is a round result, not an approval.
+        self.assertIn("不是核准", text)
+
+    def test_a_doc_summary_renders_nothing_a_doc_run_does_not_have(self):
+        self.review_round(self.doc_review(
+            "CHANGES_REQUIRED", findings=[self.doc_finding("D1")]
+        ))
+
+        result = generate_outputs(self.store, self.run.run_id)
+
+        text = self.output_text(result.final_summary)
+        for absent in (
+            "修復輪數", "Verification", "Diff", "Claude", "已解決項目",
+            "Knowledge", "知識", "Plan",
+        ):
+            with self.subTest(absent=absent):
+                self.assertNotIn(absent, text)
+        # No local absolute path ever reaches a human-facing summary.
+        self.assertNotIn(str(self.repo), text)
+        self.assertNotIn(str(self.store.root), text)
+
+    def test_a_doc_run_never_produces_a_knowledge_candidate(self):
+        """Two rounds of the same invariant would trigger one for a Plan run."""
+        self.review_round(
+            self.doc_review("CHANGES_REQUIRED", findings=[self.doc_finding("D1")]),
+            self.doc_review("CHANGES_REQUIRED", findings=[self.doc_finding("D2")]),
+        )
+
+        result = generate_outputs(self.store, self.run.run_id)
+
+        self.assertIsNone(result.knowledge_candidate)
+        self.assertEqual(result.candidate_triggers, ())
+        self.assertFalse(
+            self.store.artifact_exists(
+                self.store._run_directory(self.run) / "knowledge-candidate.md"
+            )
+        )
+
+    def test_a_doc_summary_lists_the_questions_a_round_asked(self):
+        state = self.review_round(self.doc_review(
+            "NEEDS_USER_INPUT", questions=["Which tier keeps the second licence?"],
+        ))
+        self.assertEqual(state.status, Status.AWAITING_USER_INPUT)
+
+        result = generate_outputs(self.store, self.run.run_id)
+
+        text = self.output_text(result.final_summary)
+        self.assertIn("NEEDS_USER_INPUT", text)
+        self.assertIn("Which tier keeps the second licence?", text)
+
+    def test_a_doc_summary_names_the_report_that_round_actually_wrote(self):
+        """Report numbers count the shelf beside the document, not run rounds.
+
+        A second run's first round is review sequence 1 but report 02, so a
+        summary that derives the name from the sequence points at another
+        run's report.
+        """
+        self.review_round(self.doc_review(
+            "CHANGES_REQUIRED", findings=[self.doc_finding("D1")]
+        ))
+        second = self.store.create(RunState.new_doc(self.manifest()))
+        self.review_round(
+            self.doc_review("CHANGES_REQUIRED", findings=[self.doc_finding("D9")]),
+            run_id=second.run_id,
+        )
+        self.assertTrue((self.document.parent / "rd-spec-review-02.md").is_file())
+
+        result = generate_outputs(self.store, second.run_id)
+
+        text = self.output_text(result.final_summary)
+        self.assertIn("docs/rd-spec-review-02.md", text)
+        self.assertNotIn("rd-spec-review-01.md", text)
+
+    def test_a_malformed_round_artifact_fails_the_doc_summary_closed(self):
+        """Untrusted evidence is named, never rendered as though it were findings."""
+        artifacts = self.store._run_directory(self.run)
+        self.store._atomic_write(artifacts / "reviews" / "0001.json", {"untrusted": "shape"})
+
+        result = generate_outputs(self.store, self.run.run_id)
+
+        text = self.output_text(result.final_summary)
+        self.assertIsNone(result.knowledge_candidate)
+        self.assertIn("無法安全產生完整摘要", text)
+        self.assertIn("reviews/0001.json", text)
+        self.assertNotIn("untrusted", text)
+
+    def test_a_paused_doc_run_names_its_reason_and_keeps_the_detail_private(self):
+        artifacts = self.store._run_directory(self.run)
+        self.store._atomic_write(
+            artifacts / "pause.json",
+            {"reason": "DOC_REPORT_NOT_WRITTEN", "detail": "private detail"},
+        )
+        object.__setattr__(self.run, "status", Status.PAUSED)
+        self.store.save(self.run)
+
+        result = generate_outputs(self.store, self.run.run_id)
+
+        text = self.output_text(result.final_summary)
+        self.assertIn("DOC_REPORT_NOT_WRITTEN", text)
+        self.assertNotIn("private detail", text)
+
+    def test_a_passing_second_round_reports_the_pass_not_the_old_findings(self):
+        self.review_round(
+            self.doc_review("CHANGES_REQUIRED", findings=[self.doc_finding("D1")]),
+            self.doc_review("PASS"),
+        )
+
+        result = generate_outputs(self.store, self.run.run_id)
+
+        text = self.output_text(result.final_summary)
+        self.assertIn("- Verdict：PASS", text)
+        self.assertIn("docs/rd-spec-review-02.md", text)
+        self.assertNotIn("D1", text)
+        self.assertIn("不是核准", text)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -66,13 +66,26 @@ def _argv(values: Iterable[str]) -> list[str]:
 
 
 def build_codex_argv(
-    repo: Path, schema: Path, output: Path, prompt: str, *, executable: str = "codex"
+    repo: Path, schema: Path, output: Path, prompt: str, *, model: str,
+    executable: str = "codex",
 ) -> list[str]:
-    """Build a read-only Codex request; prompt text remains one argv item."""
+    """Build a read-only Codex request; prompt text remains one argv item.
+
+    ``model`` is deliberately required and never defaulted.  Without ``-m``
+    the model comes from ``~/.codex/config.toml`` -- a file this tool does not
+    control -- so an edit there silently broke every run of every kind, and
+    the operator saw only ``EXTERNAL_EXIT exit=1``.  A default here would
+    recreate exactly that: a caller who forgets would inherit the global
+    config again instead of failing loudly.  The position is the one the
+    installed CLI parses: ``codex -a never exec -m <model> -C <repo> ...``.
+    """
     if not isinstance(prompt, str) or not prompt:
         raise ValueError("prompt must be a non-empty string")
+    if not isinstance(model, str) or not model:
+        raise ValueError("model must be a non-empty string")
     return _argv([
-        executable, "-a", "never", "exec", "-C", str(Path(repo).resolve()), "-s", "read-only",
+        executable, "-a", "never", "exec", "-m", model,
+        "-C", str(Path(repo).resolve()), "-s", "read-only",
         "--output-schema", str(Path(schema).resolve()),
         "-o", str(Path(output).resolve()), prompt,
     ])

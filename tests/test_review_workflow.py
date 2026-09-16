@@ -111,7 +111,19 @@ class ReviewWorkflowTestCase(unittest.TestCase):
         )
         self.authority = ApprovalAuthority(self.root / "approval.key")
         self.store = RunStore(self.root / "runs", authority=self.authority)
-        self.policy = Policy(1, 6, 8000, 3, 2, 100, 30, ["docs/**"])
+        self.policy = Policy(
+            version=1,
+            max_rounds=6,
+            max_context_tokens=8000,
+            max_initial_sources=3,
+            max_context_expansions=2,
+            production_line_limit=100,
+            production_growth_percent=30,
+            production_excludes=["docs/**"],
+            doc_max_initial_sources=5,
+            doc_max_context_tokens=16000,
+            codex_model="gpt-5.6-sol",
+        )
         self.brief = "Review the completed retry fix."
         self.run = self.create_run()
         self.diff_stats = None
@@ -1688,11 +1700,11 @@ class ReviewRunnerRoutingTests(ReviewWorkflowTestCase):
         for mode, expected in (
             ("plan", "codex-plan.md"), ("code", "codex-code.md"), ("review", "codex-review.md"),
         ):
-            codex = _LocalCodex(self.repo, identity, mode=mode)
+            codex = _LocalCodex(self.repo, identity, mode=mode, model=self.policy.codex_model)
             prompts[mode] = codex._PROMPTS[codex.mode]
             self.assertEqual(prompts[mode], expected)
         with self.assertRaises(ValueError):
-            _LocalCodex(self.repo, identity, mode="android")
+            _LocalCodex(self.repo, identity, mode="android", model=self.policy.codex_model)
 
     def test_local_claude_review_mode_repairs_only_and_never_implements(self):
         from ai_review.cli import _LocalClaude

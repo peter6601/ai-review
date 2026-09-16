@@ -9,3 +9,9 @@ production_excludes:
   - "docs/**"
   - "**/*Tests/**"
   - "**/*UITests/**"
+doc_max_initial_sources: 5
+doc_max_context_tokens: 16000
+# The tool states the model it requires rather than inheriting whatever
+# ~/.codex/config.toml names: that file is outside this tool's control, and an
+# unrelated edit to it broke every run of all four kinds at once.
+codex_model: gpt-5.6-sol

@@ -11,6 +11,20 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 
+class RecordingCodex:
+    """A Codex boundary that records every input and refuses an extra call."""
+
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.calls = []
+
+    def review(self, inputs):
+        self.calls.append(inputs)
+        if not self.responses:
+            raise AssertionError("Codex was called more times than the test expected")
+        return self.responses.pop(0)
+
+
 class CliContractTests(unittest.TestCase):
     def setUp(self):
         from ai_review.cli import main
@@ -173,6 +187,40 @@ class CliContractTests(unittest.TestCase):
         self.assertFalse(any(path.name == ".ai-review" for path in self.repo.rglob("*")))
         codex.assert_not_called()
         claude.assert_not_called()
+
+    def test_review_approval_rebuilds_context_under_the_packet_budget(self):
+        """max_context_tokens sits inside the packet checksum, so the rebuild must reuse it."""
+        from ai_review import context as context_module
+
+        note = self.root / "note.md"
+        note.write_text("# Exact\nRetry constraints.\n", encoding="utf-8")
+        code, stdout, stderr = self.init_review("--source", "%s#Exact" % note)
+        self.assertEqual((code, stderr), (0, ""))
+        run_id = json.loads(stdout)["run_id"]
+        original_run = subprocess.run
+        rebuild_kwargs = []
+
+        def recording_build_packet(*args, **kwargs):
+            rebuild_kwargs.append(kwargs)
+            return context_module.build_packet(*args, **kwargs)
+
+        def osascript_approval(argv, *args, **kwargs):
+            if argv[0] == "/usr/bin/osascript":
+                return subprocess.CompletedProcess(
+                    argv, 0, "button returned:Approve\n", "",
+                )
+            return original_run(argv, *args, **kwargs)
+
+        with patch("ai_review.cli.platform.system", return_value="Darwin"), patch(
+            "ai_review.cli.subprocess.run", side_effect=osascript_approval,
+        ), patch("ai_review.cli.build_packet", side_effect=recording_build_packet):
+            approved, output, error = self.cli("approve-review", run_id)
+
+        self.assertEqual((approved, error), (0, ""))
+        self.assertEqual(json.loads(output)["status"], "READY")
+        self.assertTrue(rebuild_kwargs, "approval did not rebuild the context packet")
+        for kwargs in rebuild_kwargs:
+            self.assertIn("max_tokens", kwargs)
 
     def test_review_init_binds_exact_context_and_rejects_empty_patch(self):
         note = self.root / "note.md"
@@ -1093,7 +1141,7 @@ class CliContractTests(unittest.TestCase):
 
         with patch("ai_review.cli.subprocess.run", side_effect=codex_result):
             with self.assertRaises(RunnerError) as raised:
-                _LocalCodex(self.repo).review({"plan": "# Plan\n"})
+                _LocalCodex(self.repo, model="gpt-5.6-sol").review({"plan": "# Plan\n"})
 
         self.assertEqual(str(raised.exception), "EXTERNAL_EXIT exit=1")
         self.assertEqual(len(observed), 1)
@@ -1110,7 +1158,7 @@ class CliContractTests(unittest.TestCase):
 
         with patch("ai_review.cli.subprocess.run", side_effect=no_output):
             with self.assertRaisesRegex(RunnerError, "EXTERNAL_EXIT exit=1") as raised:
-                _LocalCodex(self.repo).review({"plan": "# Plan\n"})
+                _LocalCodex(self.repo, model="gpt-5.6-sol").review({"plan": "# Plan\n"})
 
         self.assertNotIn("never-leak", str(raised.exception))
 
@@ -1137,7 +1185,9 @@ class CliContractTests(unittest.TestCase):
 
                 with patch("ai_review.cli.subprocess.run", side_effect=invalid_output):
                     with self.assertRaises(RunnerError):
-                        _LocalCodex(self.repo).review({"plan": "# Plan\n"})
+                        _LocalCodex(
+                            self.repo, model="gpt-5.6-sol",
+                        ).review({"plan": "# Plan\n"})
 
     def test_authority_storage_error_is_a_bounded_invalid_input_response(self):
         def unavailable(_args):
@@ -1149,6 +1199,1072 @@ class CliContractTests(unittest.TestCase):
         self.assertEqual(stdout, "")
         self.assertNotIn("Traceback", stderr)
         self.assertNotIn("should-not-escape", stderr)
+
+    # ---- doc run kind ----------------------------------------------------
+
+    DOC_BRIEF = "  離線編輯的 RD spec，給 PM 與 QA 讀  "
+
+    def write_doc(self, text="# 離線編輯\n\n使用者可在離線時編輯內容。\n"):
+        """Commit one document inside the repository and return its path."""
+        document = self.repo / "docs" / "rd-spec.md"
+        document.write_text(text, encoding="utf-8")
+        self.git("add", "docs/rd-spec.md")
+        self.git("commit", "-m", "rd spec")
+        return document
+
+    def init_doc(self, *extra, doc="docs/rd-spec.md", lens="requirement"):
+        return self.cli(
+            "init", "doc", "--repo", str(self.repo), "--doc", doc,
+            "--lens", lens,
+            "--lens-reason", "文件只描述使用者行為，沒有任何檔案路徑",
+            "--brief", self.DOC_BRIEF,
+            *extra,
+        )
+
+    def doc_state(self):
+        return json.loads(
+            next(self.runs.rglob("state.json")).read_text(encoding="utf-8")
+        )
+
+    def test_doc_init_rejects_a_verification_flag_outright(self):
+        """A doc run has no verification; --verify must fail, not be ignored."""
+        self.write_doc()
+
+        code, stdout, stderr = self.init_doc(
+            "--verify", "%s -m unittest tests.test_doc" % sys.executable,
+        )
+
+        self.assertEqual((code, stdout), (2, ""))
+        self.assertIn("unrecognized arguments", stderr)
+        self.assertFalse(self.runs.exists())
+
+    def test_doc_init_requires_a_known_lens_with_a_reason_and_a_brief(self):
+        self.write_doc()
+        base = (
+            "init", "doc", "--repo", str(self.repo), "--doc", "docs/rd-spec.md",
+        )
+        reason = ("--lens-reason", "只描述使用者行為")
+        brief = ("--brief", "給 PM 讀的 spec")
+        for tail in (
+            ("--lens", "architecture") + reason + brief,   # not one of the three
+            ("--lens", "") + reason + brief,               # empty is not a lens
+            ("--lens", "requirement") + brief,             # missing --lens-reason
+            ("--lens", "requirement") + reason,            # missing --brief
+            reason + brief,                                # missing --lens
+        ):
+            with self.subTest(tail=tail):
+                code, stdout, _stderr = self.cli(*(base + tail))
+                self.assertEqual((code, stdout), (2, ""))
+        self.assertFalse(self.runs.exists())
+
+        # Positive control: the same command with all three accepted arguments
+        # must succeed, so the rejections above are about the arguments and not
+        # about the subcommand being unreachable.
+        for lens in ("requirement", "direction", "implementation"):
+            with self.subTest(lens=lens):
+                code, _stdout, stderr = self.cli(
+                    *(base + ("--lens", lens) + reason + brief)
+                )
+                self.assertEqual((code, stderr), (0, ""))
+
+    def test_doc_init_rejects_a_document_outside_missing_or_not_a_file(self):
+        self.write_doc()
+        outside = self.root / "outside.md"
+        outside.write_text("# Outside\n", encoding="utf-8")
+
+        code, stdout, stderr = self.init_doc(doc=str(outside))
+        self.assertEqual((code, stdout), (2, ""))
+        self.assertIn("inside repository", stderr)
+
+        code, stdout, stderr = self.init_doc(doc="docs")
+        self.assertEqual((code, stdout), (2, ""))
+        self.assertIn("regular file", stderr)
+
+        code, stdout, stderr = self.init_doc(doc="docs/absent.md")
+        self.assertEqual((code, stdout), (2, ""))
+        self.assertIn("regular file", stderr)
+
+        self.assertFalse(self.runs.exists())
+
+    def test_doc_init_binds_the_lens_and_the_exact_document_and_brief_bytes(self):
+        document = self.write_doc()
+        expected_doc_digest = hashlib.sha256(document.read_bytes()).hexdigest()
+        expected_brief_digest = hashlib.sha256(
+            self.DOC_BRIEF.strip().encode("utf-8")
+        ).hexdigest()
+        head = self.git("rev-parse", "HEAD").stdout.strip()
+
+        code, stdout, stderr = self.init_doc(lens="direction")
+
+        self.assertEqual((code, stderr), (0, ""))
+        payload = json.loads(stdout)
+        self.assertEqual(payload["kind"], "doc")
+        self.assertEqual(payload["status"], "READY")
+        manifest = self.doc_state()["manifest"]
+        self.assertEqual(manifest["kind"], "doc")
+        self.assertEqual(manifest["lens"], "direction")
+        self.assertEqual(manifest["lens_reason"], "文件只描述使用者行為，沒有任何檔案路徑")
+        self.assertEqual(manifest["doc_digest"], expected_doc_digest)
+        self.assertEqual(manifest["brief_digest"], expected_brief_digest)
+        self.assertEqual(manifest["brief"], self.DOC_BRIEF.strip())
+        self.assertEqual(manifest["doc_path"], str(document.resolve()))
+        self.assertEqual(manifest["base_oid"], head)
+        self.assertEqual(manifest["base_ref"], "HEAD")
+        self.assertEqual(set(manifest["review_executables"]), {"codex", "claude"})
+        self.assertNotIn("plan_path", manifest)
+        self.assertNotIn("verification_commands", manifest)
+
+    def test_doc_init_never_builds_a_verification_command(self):
+        """A doc run runs nothing, so the verification builder must stay untouched."""
+        self.write_doc()
+
+        def tripwire(*args, **kwargs):
+            raise AssertionError("a doc run must never build a verification command")
+
+        with patch("ai_review.cli._test_commands", side_effect=tripwire):
+            code, _stdout, stderr = self.init_doc()
+
+        self.assertEqual((code, stderr), (0, ""))
+
+    def test_doc_init_accepts_five_sources_under_the_doc_budget_and_rejects_six(self):
+        """The doc budget is the policy's, not the Plan default the CLI used to inherit."""
+        from ai_review.context import BUDGET_METHOD_DOC
+        from ai_review.policy import load_policy
+
+        self.write_doc()
+        policy = load_policy(
+            Path(__file__).resolve().parents[1] / "config" / "defaults.yaml"
+        )
+        max_sources, max_tokens = policy.context_limits("doc")
+        self.assertEqual((max_sources, max_tokens), (5, 16000))
+        self.assertNotEqual(policy.context_limits("plan"), (max_sources, max_tokens))
+
+        selected = []
+        for index in range(max_sources + 1):
+            source = self.root / ("doc-source-%d.md" % index)
+            source.write_text("# Exact\n約束 %d。\n" % index, encoding="utf-8")
+            selected.extend(["--source", "%s#Exact" % source])
+
+        code, stdout, stderr = self.init_doc(*selected[: 2 * max_sources])
+        self.assertEqual((code, stderr), (0, ""))
+        manifest = json.loads(
+            next(self.runs.rglob("context-manifest.json")).read_text(encoding="utf-8")
+        )
+        self.assertEqual(len(manifest["selected"]), max_sources)
+        self.assertEqual(manifest["max_context_tokens"], max_tokens)
+        self.assertEqual(manifest["budget_method"], BUDGET_METHOD_DOC)
+        self.assertRegex(self.doc_state()["manifest"]["context_checksum"], r"^[0-9a-f]{64}$")
+
+        code, stdout, stderr = self.cli(
+            "init", "doc", "--repo", str(self.repo), "--doc", "docs/rd-spec.md",
+            "--lens", "requirement", "--lens-reason", "行為描述", "--brief", "spec",
+            *selected,
+        )
+        self.assertEqual((code, stdout), (2, ""))
+        self.assertIn("no more than %d" % max_sources, stderr)
+
+    def test_local_codex_doc_mode_sends_the_prompt_for_its_lens(self):
+        from ai_review.cli import _LocalCodex
+        from ai_review.process_security import executable_identity
+
+        identity = executable_identity(Path(sys.executable))
+        prompts = Path(__file__).resolve().parents[1] / "prompts"
+        for lens in ("requirement", "direction", "implementation"):
+            with self.subTest(lens=lens):
+                expected = (prompts / ("codex-doc-%s.md" % lens)).read_text(encoding="utf-8")
+                sent = []
+
+                def capture(repo, schema, output, prompt, *, model, executable):
+                    sent.append(prompt)
+                    return [executable]
+
+                with patch("ai_review.cli.build_codex_argv", side_effect=capture), patch(
+                    "ai_review.cli._run_codex_with_output", return_value={"verdict": "PASS"},
+                ):
+                    _LocalCodex(
+                        self.repo, identity, mode="doc", lens=lens, model="gpt-5.6-sol",
+                    ).review({"document": "# Doc\n"})
+
+                self.assertEqual(len(sent), 1)
+                self.assertTrue(sent[0].startswith(expected))
+                self.assertIn("INPUT_JSON", sent[0])
+
+        for rejected in (
+            {"mode": "doc"},
+            {"mode": "doc", "lens": "architecture"},
+            {"mode": "plan", "lens": "requirement"},
+        ):
+            with self.subTest(**rejected):
+                with self.assertRaises(ValueError):
+                    _LocalCodex(self.repo, identity, model="gpt-5.6-sol", **rejected)
+
+    def test_default_workflow_factory_builds_a_claude_free_doc_workflow(self):
+        from ai_review.cli import _LocalCodex, _default_workflow_factory
+        from ai_review.doc_workflow import DocWorkflow
+        from ai_review.workflow import WorkflowError
+
+        self.write_doc()
+        code, stdout, stderr = self.init_doc(lens="implementation")
+        self.assertEqual((code, stderr), (0, ""))
+        store = self.cli_store()
+        state = store.load(json.loads(stdout)["run_id"])
+
+        workflow = _default_workflow_factory(kind="doc", store=store, state=state)
+
+        self.assertIsInstance(workflow, DocWorkflow)
+        self.assertIsInstance(workflow.codex, _LocalCodex)
+        self.assertEqual(workflow.codex.mode, "doc")
+        self.assertEqual(workflow.codex.lens, "implementation")
+        with self.assertRaises(WorkflowError):
+            workflow.claude.repair({})
+
+    def test_every_codex_construction_path_pins_the_policy_model_in_its_argv(self):
+        """Regression: no ``-m`` anywhere, so every kind inherited the global config.
+
+        A change to ``~/.codex/config.toml`` -- a file this tool does not own
+        -- silently broke all four kinds at once, and the operator only saw
+        ``EXTERNAL_EXIT exit=1``.  This asserts on the argv that actually
+        reaches the subprocess boundary, for the doc kind and for a non-doc
+        kind, because that boundary is where the omission lived.
+        """
+        from ai_review.cli import _LocalCodex, _default_workflow_factory
+        from ai_review.policy import load_policy
+        from ai_review.process_security import executable_identity
+
+        expected = load_policy(
+            Path(__file__).resolve().parents[1] / "config" / "defaults.yaml"
+        ).codex_model
+        review = {
+            "verdict": "PASS", "summary": "structurally valid result",
+            "findings": [], "questions": [], "context_requests": [],
+        }
+        store = self.cli_store()
+
+        self.write_doc()
+        code, stdout, stderr = self.init_doc()
+        self.assertEqual((code, stderr), (0, ""))
+        doc_state = store.load(json.loads(stdout)["run_id"])
+
+        code, stdout, stderr = self.init_plan()
+        self.assertEqual((code, stderr), (0, ""))
+        plan_state = store.load(json.loads(stdout)["run_id"])
+
+        for kind, state, inputs in (
+            ("doc", doc_state, {"document": "# Doc\n"}),
+            ("plan", plan_state, {"plan": "# Plan\n"}),
+        ):
+            with self.subTest(kind=kind):
+                workflow = _default_workflow_factory(kind=kind, store=store, state=state)
+                # Keep the identity gate deterministic; the model is what is
+                # under test, and it is set before this line by construction.
+                workflow.codex.identity = executable_identity(Path(sys.executable))
+                observed = []
+
+                def record(argv, **_kwargs):
+                    observed.append(list(argv))
+                    Path(argv[argv.index("-o") + 1]).write_text(
+                        json.dumps(review), encoding="utf-8"
+                    )
+                    return subprocess.CompletedProcess(argv, 0, "", "")
+
+                with patch("ai_review.cli.subprocess.run", side_effect=record):
+                    workflow.codex.review(inputs)
+
+                self.assertEqual(len(observed), 1)
+                argv = observed[0]
+                self.assertEqual(argv.count("-m"), 1)
+                self.assertEqual(argv[argv.index("-m") + 1], expected)
+                self.assertEqual(argv[argv.index("-C") + 1], str(self.repo.resolve()))
+
+        # No construction path may omit it: there is no default to inherit.
+        with self.assertRaises(TypeError):
+            _LocalCodex(self.repo, mode="plan")
+
+        # The argv above proves the pin reaches the process boundary.  This
+        # proves every construction site in the factory states the model for
+        # itself, for all four kinds, rather than leaving it to a fall back.
+        for kind, state in (
+            ("doc", doc_state), ("plan", plan_state),
+            ("code", plan_state), ("review", plan_state),
+        ):
+            with self.subTest(construction=kind):
+                with patch("ai_review.cli._LocalCodex") as constructor:
+                    _default_workflow_factory(kind=kind, store=store, state=state)
+
+                self.assertEqual(constructor.call_count, 1)
+                self.assertEqual(constructor.call_args.kwargs.get("model"), expected)
+
+    def test_doc_payload_reads_doc_path_and_knows_every_doc_next_action(self):
+        """Regression: _payload raised KeyError on the status and AttributeError on plan_path."""
+        from ai_review.cli import _payload
+        from ai_review.models import DocManifest, RunState, Status
+
+        document = self.write_doc()
+        brief = "給 PM 與 QA 讀的 spec"
+        manifest = DocManifest(
+            kind="doc", repo_path=str(self.repo), doc_path=str(document),
+            base_ref="HEAD", base_oid=self.git("rev-parse", "HEAD").stdout.strip(),
+            lens="direction", lens_reason="文件在挑做法", brief=brief,
+            brief_digest=hashlib.sha256(brief.encode("utf-8")).hexdigest(),
+            doc_digest=hashlib.sha256(document.read_bytes()).hexdigest(),
+        )
+        state = RunState.new_doc(manifest)
+        object.__setattr__(state, "run_id", "doc-payload")
+        store = Mock()
+        store._run_directory.return_value = self.runs / "project" / "doc-payload"
+        store.artifact_exists.return_value = False
+
+        for status in (Status.READY, Status.RUNNING, Status.AWAITING_USER_INPUT,
+                       Status.PAUSED, Status.AWAITING_HUMAN_DOC_REVIEW):
+            with self.subTest(status=status):
+                object.__setattr__(state, "status", status)
+                payload = _payload(store, state)
+                self.assertTrue(payload["next_action"])
+                self.assertEqual(
+                    payload["doc_digest"],
+                    hashlib.sha256(document.read_bytes()).hexdigest(),
+                )
+                self.assertEqual(payload["lens"], "direction")
+                self.assertEqual(payload["brief_digest"], manifest.brief_digest)
+                self.assertNotIn("plan_digest", payload)
+
+    def test_status_on_a_finished_doc_run_reports_its_document_digest(self):
+        document = self.write_doc()
+        code, stdout, stderr = self.init_doc()
+        self.assertEqual((code, stderr), (0, ""))
+        run_id = json.loads(stdout)["run_id"]
+        state_path = next(self.runs.rglob("state.json"))
+        contents = json.loads(state_path.read_text(encoding="utf-8"))
+        contents["status"] = "AWAITING_HUMAN_DOC_REVIEW"
+        state_path.write_text(json.dumps(contents), encoding="utf-8")
+
+        code, stdout, stderr = self.cli("status", run_id)
+
+        self.assertEqual((code, stderr), (0, ""))
+        payload = json.loads(stdout)
+        self.assertEqual(payload["status"], "AWAITING_HUMAN_DOC_REVIEW")
+        self.assertEqual(payload["next_action"], "human_doc_review")
+        self.assertEqual(
+            payload["doc_digest"], hashlib.sha256(document.read_bytes()).hexdigest()
+        )
+        self.assertEqual(payload["lens"], "requirement")
+        self.assertEqual(
+            payload["brief_digest"],
+            hashlib.sha256(self.DOC_BRIEF.strip().encode("utf-8")).hexdigest(),
+        )
+        self.assertNotIn("plan_digest", payload)
+
+    def test_a_finished_doc_run_generates_its_report(self):
+        from ai_review.doc_workflow import DocWorkflow
+
+        self.write_doc()
+        code, stdout, stderr = self.init_doc()
+        self.assertEqual((code, stderr), (0, ""))
+        run_id = json.loads(stdout)["run_id"]
+
+        class PassingCodex:
+            def review(_self, inputs):
+                return {
+                    "verdict": "PASS", "summary": "the document is clear",
+                    "findings": [], "questions": [], "context_requests": [],
+                }
+
+        def factory(*, kind, store, state, context_packet=None):
+            self.assertEqual(kind, "doc")
+            return DocWorkflow(store, PassingCodex(), None, context_packet=context_packet)
+
+        with patch("ai_review.cli.generate_outputs") as outputs:
+            code, stdout, stderr = self.cli("run", run_id, workflow_factory=factory)
+
+        self.assertEqual((code, stderr), (0, ""))
+        self.assertEqual(json.loads(stdout)["status"], "AWAITING_HUMAN_DOC_REVIEW")
+        self.assertEqual(
+            [call.args[1] for call in outputs.call_args_list], [run_id]
+        )
+
+    # ---- re-review -------------------------------------------------------
+
+    EDITED_DOC = (
+        "# 離線編輯\n\n使用者可在離線時編輯內容。\n\n"
+        "## 衝突\n兩邊都改過時，以最後存檔為準。\n"
+    )
+
+    def doc_finding(self, identifier):
+        return {
+            "id": identifier,
+            "severity": "major",
+            "invariant": "every scenario states its completion condition",
+            "location": "docs/rd-spec.md:3",
+            "evidence": "the scenario states no observable result",
+            "required_outcome": "state what proves the scenario finished",
+            "lineage": {
+                "resolution": "newly_discovered",
+                "discovery_reason": "first pass over this document",
+            },
+        }
+
+    def doc_review(self, *finding_ids):
+        """One valid Codex doc review; findings make it CHANGES_REQUIRED."""
+        return {
+            "verdict": "CHANGES_REQUIRED" if finding_ids else "PASS",
+            "summary": "document review result",
+            "findings": [self.doc_finding(item) for item in finding_ids],
+            "questions": [],
+            "context_requests": [],
+        }
+
+    def doc_factory(self, codex, *, fault_injector=None):
+        """Build the real DocWorkflow around a recorded Codex boundary."""
+        from ai_review.doc_workflow import DocWorkflow
+
+        def factory(*, kind, store, state, context_packet=None):
+            self.assertEqual(kind, "doc")
+            return DocWorkflow(
+                store, codex, None, context_packet=context_packet,
+                fault_injector=fault_injector,
+            )
+
+        return factory
+
+    def tripwire_factory(self):
+        def factory(**kwargs):
+            raise AssertionError("a refused re-review must never build a workflow")
+
+        return factory
+
+    def run_directory(self, run_id):
+        matches = [
+            path.parent for path in self.runs.rglob("state.json")
+            if path.parent.name == run_id
+        ]
+        self.assertEqual(len(matches), 1, matches)
+        return matches[0]
+
+    def edit_doc(self):
+        """Edit the reviewed document the way a human would: in the worktree."""
+        document = self.repo / "docs" / "rd-spec.md"
+        document.write_text(self.EDITED_DOC, encoding="utf-8")
+        return document
+
+    def finished_doc_run(self, *, finding_ids=("DOC-001",), extra_responses=()):
+        """Init one doc run and take it through a first Codex round."""
+        self.write_doc()
+        code, stdout, stderr = self.init_doc()
+        self.assertEqual((code, stderr), (0, ""))
+        run_id = json.loads(stdout)["run_id"]
+        codex = RecordingCodex([self.doc_review(*finding_ids), *extra_responses])
+        with patch("ai_review.cli.generate_outputs"):
+            code, stdout, stderr = self.cli(
+                "run", run_id, workflow_factory=self.doc_factory(codex),
+            )
+        self.assertEqual((code, stderr), (0, ""))
+        self.assertEqual(json.loads(stdout)["status"], "AWAITING_HUMAN_DOC_REVIEW")
+        self.assertEqual(len(codex.calls), 1)
+        return run_id, codex
+
+    def test_re_review_refuses_an_unchanged_document(self):
+        """An unchanged document would burn a Codex session for known findings."""
+        # The second response is a loaded gun: it must not fire.
+        run_id, codex = self.finished_doc_run(extra_responses=(self.doc_review(),))
+        directory = self.run_directory(run_id)
+        before = (directory / "state.json").read_bytes()
+
+        code, stdout, stderr = self.cli(
+            "re-review", run_id, workflow_factory=self.doc_factory(codex),
+        )
+
+        self.assertEqual((code, stdout), (2, ""))
+        self.assertIn("unchanged", stderr)
+        self.assertEqual((directory / "state.json").read_bytes(), before)
+        self.assertEqual(len(codex.calls), 1)
+        self.assertEqual(
+            sorted(path.name for path in (directory / "reviews").iterdir()),
+            ["0001.json"],
+        )
+        self.assertEqual(
+            sorted(path.name for path in (directory / "review-actions").iterdir()),
+            ["0001.json"],
+        )
+
+        code, stdout, stderr = self.cli("status", run_id)
+        self.assertEqual((code, stderr), (0, ""))
+        self.assertEqual(json.loads(stdout)["status"], "AWAITING_HUMAN_DOC_REVIEW")
+
+    def test_re_review_of_an_edited_document_runs_one_more_codex_pass(self):
+        run_id, codex = self.finished_doc_run(extra_responses=(self.doc_review(),))
+        directory = self.run_directory(run_id)
+        document = self.edit_doc()
+        edited_bytes = document.read_bytes()
+
+        with patch("ai_review.cli.generate_outputs") as outputs:
+            code, stdout, stderr = self.cli(
+                "re-review", run_id, workflow_factory=self.doc_factory(codex),
+            )
+
+        self.assertEqual((code, stderr), (0, ""))
+        payload = json.loads(stdout)
+        self.assertEqual(payload["status"], "AWAITING_HUMAN_DOC_REVIEW")
+        self.assertEqual(payload["kind"], "doc")
+        self.assertEqual(payload["repair_round"], 0)
+        self.assertEqual(len(codex.calls), 2)
+        self.assertEqual(
+            sorted(path.name for path in (directory / "reviews").iterdir()),
+            ["0001.json", "0002.json"],
+        )
+        self.assertEqual(
+            json.loads(
+                (directory / "reviews" / "0002.json").read_text(encoding="utf-8")
+            )["verdict"],
+            "PASS",
+        )
+        # The reviewed document is the human's; nothing in the round writes it.
+        self.assertEqual(document.read_bytes(), edited_bytes)
+        # The terminal report still fires for the second round.
+        self.assertEqual([call.args[1] for call in outputs.call_args_list], [run_id])
+
+    def test_the_second_round_carries_the_first_rounds_findings(self):
+        """Without this, a run that forgets every round looks identical outside."""
+        run_id, codex = self.finished_doc_run(
+            finding_ids=("DOC-001", "DOC-002"), extra_responses=(self.doc_review(),),
+        )
+        self.edit_doc()
+
+        with patch("ai_review.cli.generate_outputs"):
+            code, _stdout, stderr = self.cli(
+                "re-review", run_id, workflow_factory=self.doc_factory(codex),
+            )
+
+        self.assertEqual((code, stderr), (0, ""))
+        self.assertEqual(len(codex.calls), 2)
+        self.assertEqual(codex.calls[0]["unresolved_prior_findings"], [])
+        self.assertEqual(
+            [item["id"] for item in codex.calls[1]["unresolved_prior_findings"]],
+            ["DOC-001", "DOC-002"],
+        )
+        # The same review, of the changed bytes.
+        self.assertEqual(codex.calls[1]["document"], self.EDITED_DOC)
+        self.assertEqual(codex.calls[1]["lens"], codex.calls[0]["lens"])
+        self.assertEqual(codex.calls[1]["brief"], codex.calls[0]["brief"])
+
+    def test_re_review_rebinds_the_manifest_to_the_new_document_bytes(self):
+        run_id, codex = self.finished_doc_run(extra_responses=(self.doc_review(),))
+        directory = self.run_directory(run_id)
+        before = json.loads(
+            (directory / "state.json").read_text(encoding="utf-8")
+        )["manifest"]
+        document = self.edit_doc()
+        expected = hashlib.sha256(document.read_bytes()).hexdigest()
+        self.assertNotEqual(expected, before["doc_digest"])
+
+        with patch("ai_review.cli.generate_outputs"):
+            code, stdout, stderr = self.cli(
+                "re-review", run_id, workflow_factory=self.doc_factory(codex),
+            )
+
+        self.assertEqual((code, stderr), (0, ""))
+        manifest = json.loads(
+            (directory / "state.json").read_text(encoding="utf-8")
+        )["manifest"]
+        self.assertEqual(manifest["doc_digest"], expected)
+        self.assertEqual(manifest, dict(before, doc_digest=expected))
+        self.assertEqual(json.loads(stdout)["doc_digest"], expected)
+
+    def test_re_review_refuses_every_other_run_kind(self):
+        from ai_review.models import Status
+
+        _code, stdout, _stderr = self.init_plan()
+        plan_run = json.loads(stdout)["run_id"]
+        code, stdout, stderr = self.cli(
+            "re-review", plan_run, workflow_factory=self.tripwire_factory(),
+        )
+        self.assertEqual((code, stdout), (2, ""))
+        self.assertIn("doc run", stderr)
+
+        review_run = self.approved_review()
+        code, stdout, stderr = self.cli(
+            "re-review", review_run, workflow_factory=self.tripwire_factory(),
+        )
+        self.assertEqual((code, stdout), (2, ""))
+        self.assertIn("doc run", stderr)
+
+        code_run = self.code_run_from_approved_plan()
+        code, stdout, stderr = self.cli(
+            "re-review", code_run, workflow_factory=self.tripwire_factory(),
+        )
+        self.assertEqual((code, stdout), (2, ""))
+        self.assertIn("doc run", stderr)
+
+    def code_run_from_approved_plan(self):
+        """Approve one Plan through the real gate and return its Code run id."""
+        _code, stdout, _stderr = self.init_plan()
+        plan_run = json.loads(stdout)["run_id"]
+        state = self.run_directory(plan_run) / "state.json"
+        contents = json.loads(state.read_text(encoding="utf-8"))
+        contents["status"] = "AWAITING_HUMAN_PLAN_REVIEW"
+        state.write_text(json.dumps(contents), encoding="utf-8")
+        original_run = subprocess.run
+
+        def approve(argv, *args, **kwargs):
+            if argv[0] == "/usr/bin/osascript":
+                return subprocess.CompletedProcess(argv, 0, "button returned:Approve\n", "")
+            return original_run(argv, *args, **kwargs)
+
+        with patch("ai_review.cli.platform.system", return_value="Darwin"), patch(
+            "ai_review.cli.subprocess.run", side_effect=approve,
+        ):
+            code, _output, stderr = self.cli("approve-plan", plan_run)
+        self.assertEqual((code, stderr), (0, ""))
+        code, stdout, stderr = self.cli(
+            "init", "code", "--repo", str(self.repo), "--plan-run", plan_run,
+            "--base", "HEAD",
+        )
+        self.assertEqual((code, stderr), (0, ""))
+        return json.loads(stdout)["run_id"]
+
+    def test_re_review_refuses_a_doc_run_that_is_not_awaiting_its_reader(self):
+        self.write_doc()
+        code, stdout, stderr = self.init_doc()
+        self.assertEqual((code, stderr), (0, ""))
+        run_id = json.loads(stdout)["run_id"]
+        state = self.run_directory(run_id) / "state.json"
+        self.edit_doc()
+
+        for status in ("READY", "RUNNING", "PAUSED"):
+            with self.subTest(status=status):
+                contents = json.loads(state.read_text(encoding="utf-8"))
+                contents["status"] = status
+                state.write_text(json.dumps(contents), encoding="utf-8")
+                before = state.read_bytes()
+
+                code, stdout, stderr = self.cli(
+                    "re-review", run_id, workflow_factory=self.tripwire_factory(),
+                )
+
+                self.assertEqual((code, stdout), (2, ""))
+                # The operator is told which status they actually have.
+                self.assertIn(status, stderr)
+                self.assertEqual(state.read_bytes(), before)
+
+    def test_re_review_of_a_deleted_document_fails_cleanly(self):
+        run_id, codex = self.finished_doc_run()
+        directory = self.run_directory(run_id)
+        before = (directory / "state.json").read_bytes()
+        (self.repo / "docs" / "rd-spec.md").unlink()
+
+        code, stdout, stderr = self.cli(
+            "re-review", run_id, workflow_factory=self.tripwire_factory(),
+        )
+
+        self.assertEqual((code, stdout), (2, ""))
+        self.assertIn("document", stderr)
+        self.assertNotIn("Traceback", stderr)
+        self.assertEqual(stderr.count("\n"), 1)
+        self.assertEqual((directory / "state.json").read_bytes(), before)
+        self.assertEqual(len(codex.calls), 1)
+
+    def test_re_review_takes_no_flag_that_bypasses_the_unchanged_refusal(self):
+        run_id, _codex = self.finished_doc_run()
+
+        for flag in ("--force", "--lens", "--doc"):
+            with self.subTest(flag=flag):
+                code, stdout, stderr = self.cli(
+                    "re-review", run_id, flag, "x",
+                    workflow_factory=self.tripwire_factory(),
+                )
+                self.assertEqual((code, stdout), (2, ""))
+                self.assertIn("unrecognized arguments", stderr)
+
+    # ---- a malformed answers file must not destroy the run ---------------
+    #
+    # Defect from a real dry run against Codex: `answer` validated the answers
+    # inside `WorkflowError`-catching code, so a file keyed by question text
+    # instead of question id paused the run (`INVALID_DOC_USER_ANSWER`).  No
+    # command returns a PAUSED run to `AWAITING_USER_INPUT`, so one typo threw
+    # away a completed, separately billed Codex round.  These tests assert the
+    # state after the refusal, not merely the exit code.
+
+    DOC_QUESTIONS = (
+        "功能上線後，既有使用者預設是否啟用離線編輯？",
+        "離線修改與雲端版本衝突時，應以哪一邊為準？",
+    )
+
+    def doc_questions_review(self, *questions):
+        """One valid Codex doc review that parks the run on its questions."""
+        return {
+            "verdict": "NEEDS_USER_INPUT",
+            "summary": "the document leaves the licence switch ambiguous",
+            "findings": [],
+            "questions": list(questions or self.DOC_QUESTIONS),
+            "context_requests": [],
+        }
+
+    def parked_doc_run(self, *, extra_responses=()):
+        """Init one doc run and park it at AWAITING_USER_INPUT, as Codex did."""
+        self.write_doc()
+        code, stdout, stderr = self.init_doc()
+        self.assertEqual((code, stderr), (0, ""))
+        run_id = json.loads(stdout)["run_id"]
+        codex = RecordingCodex([self.doc_questions_review(), *extra_responses])
+        code, stdout, stderr = self.cli(
+            "run", run_id, workflow_factory=self.doc_factory(codex),
+        )
+        self.assertEqual((code, stderr), (0, ""))
+        self.assertEqual(json.loads(stdout)["status"], "AWAITING_USER_INPUT")
+        persisted = json.loads(
+            (self.run_directory(run_id) / "user-questions.json").read_text(encoding="utf-8")
+        )["questions"]
+        # The artifact keys the answers file: ids, with the text beside them.
+        self.assertEqual([item["id"] for item in persisted], ["Q-001", "Q-002"])
+        self.assertEqual(
+            [item["question"] for item in persisted], list(self.DOC_QUESTIONS),
+        )
+        return run_id, codex
+
+    def answers_file(self, mapping, name="answers.json"):
+        path = self.root / name
+        path.write_text(json.dumps(mapping, ensure_ascii=False), encoding="utf-8")
+        return str(path)
+
+    def run_snapshot(self, run_id):
+        """Every artifact byte of the run, so a refusal can be proved inert."""
+        directory = self.run_directory(run_id)
+        return {
+            str(path.relative_to(directory)): path.read_bytes()
+            for path in sorted(directory.rglob("*")) if path.is_file()
+        }
+
+    def no_workflow_factory(self):
+        def factory(**_kwargs):
+            raise AssertionError(
+                "a malformed answers file must be refused before any workflow"
+            )
+
+        return factory
+
+    def assert_still_parked(self, run_id, before):
+        """The run is byte-identical and still answerable."""
+        directory = self.run_directory(run_id)
+        self.assertEqual(self.run_snapshot(run_id), before)
+        self.assertFalse((directory / "pause.json").exists())
+        code, stdout, stderr = self.cli("status", run_id)
+        self.assertEqual((code, stderr), (0, ""))
+        payload = json.loads(stdout)
+        self.assertEqual(payload["status"], "AWAITING_USER_INPUT")
+        self.assertEqual(payload["next_action"], "answer")
+
+    def test_answers_keyed_by_question_text_leave_the_run_awaiting_input(self):
+        """The exact defect: the wording the skill shipped, refused harmlessly."""
+        run_id, codex = self.parked_doc_run()
+        before = self.run_snapshot(run_id)
+        payload = self.answers_file(
+            {question: "ANSWER-BODY-%d" % index
+             for index, question in enumerate(self.DOC_QUESTIONS)}
+        )
+
+        code, stdout, stderr = self.cli(
+            "answer", run_id, "--answers", payload,
+            workflow_factory=self.no_workflow_factory(),
+        )
+
+        self.assertEqual((code, stdout), (2, ""))
+        # An operator can act on this: the ids expected, and what was missing.
+        self.assertIn("Q-001", stderr)
+        self.assertIn("Q-002", stderr)
+        self.assertIn("id", stderr)
+        # The user's own words are never echoed back out.
+        self.assertNotIn("ANSWER-BODY-0", stderr)
+        self.assertNotIn("ANSWER-BODY-1", stderr)
+        self.assertNotIn("Traceback", stderr)
+        self.assert_still_parked(run_id, before)
+        self.assertEqual(len(codex.calls), 1)
+
+    def test_every_malformed_answers_file_is_refused_and_changes_nothing(self):
+        run_id, codex = self.parked_doc_run()
+        before = self.run_snapshot(run_id)
+        cases = {
+            "missing one id": ({"Q-001": "只答了第一題"}, True),
+            "one extra unknown id": (
+                {"Q-001": "答案一", "Q-002": "答案二", "Q-009": "多的"}, True,
+            ),
+            "an empty-string value": ({"Q-001": "答案一", "Q-002": "   "}, True),
+            # Caught one layer out by the pre-existing JSON-shape guard, which
+            # also runs before the run is loaded; same exit code, same inert run.
+            "a non-string value": ({"Q-001": "答案一", "Q-002": 5}, False),
+        }
+        for label, (mapping, names_ids) in cases.items():
+            with self.subTest(case=label):
+                payload = self.answers_file(mapping, "answers-%d.json" % len(label))
+
+                code, stdout, stderr = self.cli(
+                    "answer", run_id, "--answers", payload,
+                    workflow_factory=self.no_workflow_factory(),
+                )
+
+                self.assertEqual((code, stdout), (2, ""))
+                self.assertNotIn("Traceback", stderr)
+                if names_ids:
+                    self.assertIn("Q-001", stderr)
+                    self.assertIn("Q-002", stderr)
+                self.assert_still_parked(run_id, before)
+        self.assertEqual(len(codex.calls), 1)
+
+    def test_an_id_keyed_answers_file_still_resumes_the_run(self):
+        run_id, codex = self.parked_doc_run(extra_responses=(self.doc_review(),))
+        payload = self.answers_file({"Q-001": "預設啟用", "Q-002": "以最後存檔為準"})
+
+        with patch("ai_review.cli.generate_outputs"):
+            code, stdout, stderr = self.cli(
+                "answer", run_id, "--answers", payload,
+                workflow_factory=self.doc_factory(codex),
+            )
+
+        self.assertEqual((code, stderr), (0, ""))
+        self.assertEqual(json.loads(stdout)["status"], "AWAITING_HUMAN_DOC_REVIEW")
+        self.assertEqual(len(codex.calls), 2)
+        submission = json.loads((
+            self.run_directory(run_id) / "question-cycles" / "0001" / "answers.json"
+        ).read_text(encoding="utf-8"))
+        self.assertEqual(
+            submission["answers"],
+            {"Q-001": "預設啟用", "Q-002": "以最後存檔為準"},
+        )
+        # The answers reach the next Codex pass as decisions, keyed by id.
+        self.assertIn("Q-001", codex.calls[1]["decision_log"])
+        self.assertIn("預設啟用", codex.calls[1]["decision_log"])
+
+    def test_a_second_conflicting_submission_is_still_refused(self):
+        """The CLI gate must not weaken the one immutable submission per pause."""
+        run_id, codex = self.parked_doc_run(extra_responses=(self.doc_review(),))
+        first = self.answers_file(
+            {"Q-001": "預設啟用", "Q-002": "以最後存檔為準"}, "first.json",
+        )
+        # A crash between the immutable submission and the state change: the
+        # answers are persisted while the run is still awaiting input, which is
+        # the only window in which a retry can reach `_answer_submission`.
+        interrupted = self.doc_factory(codex, fault_injector=lambda point: (
+            (_ for _ in ()).throw(KeyboardInterrupt())
+            if point == "after_answer_submission" else None
+        ))
+        code, stdout, _stderr = self.cli(
+            "answer", run_id, "--answers", first, workflow_factory=interrupted,
+        )
+        self.assertEqual((code, stdout), (3, ""))
+        submission = (
+            self.run_directory(run_id) / "question-cycles" / "0001" / "answers.json"
+        )
+        persisted = submission.read_bytes()
+        before = self.run_snapshot(run_id)
+        self.assert_still_parked(run_id, before)
+
+        second = self.answers_file(
+            {"Q-001": "預設關閉", "Q-002": "以最後存檔為準"}, "second.json",
+        )
+        code, stdout, stderr = self.cli(
+            "answer", run_id, "--answers", second,
+            workflow_factory=self.doc_factory(codex),
+        )
+
+        self.assertEqual((code, stdout), (2, ""))
+        self.assertIn("immutable answer submission", stderr)
+        self.assertEqual(submission.read_bytes(), persisted)
+        self.assertEqual(len(codex.calls), 1)
+        self.assert_still_parked(run_id, before)
+
+        # Only the original answers may be retried, and they still work.
+        with patch("ai_review.cli.generate_outputs"):
+            code, stdout, stderr = self.cli(
+                "answer", run_id, "--answers", first,
+                workflow_factory=self.doc_factory(codex),
+            )
+        self.assertEqual((code, stderr), (0, ""))
+        self.assertEqual(json.loads(stdout)["status"], "AWAITING_HUMAN_DOC_REVIEW")
+        self.assertEqual(submission.read_bytes(), persisted)
+        self.assertEqual(len(codex.calls), 2)
+
+
+    # ---- `answer` on a run that is not awaiting input --------------------
+    #
+    # The sibling defect, from the same dry run.  The status check lives
+    # *inside* `DocWorkflow.answer`, whose except clause pauses, so a stray
+    # `answer` on an already-PAUSED run re-paused it: `pause.json` -- the one
+    # record of why the run stopped -- was overwritten with
+    # `INVALID_DOC_USER_ANSWER`, and the command still exited 0.  On a READY or
+    # AWAITING_HUMAN_DOC_REVIEW run the same path moved a live run to PAUSED,
+    # which no command returns from.  The gate belongs beside the answers-file
+    # check: at the CLI, before the workflow exists.
+    #
+    # These tests deliberately pass the *real* workflow factory rather than a
+    # tripwire: removing the gate must show the damage it prevents -- exit 0
+    # and a rewritten `pause.json` -- not merely that a workflow was built.
+    # `test_the_status_gate_runs_before_any_workflow_is_built` covers the
+    # ordering separately.
+
+    INVALID_VERDICT_REVIEW = {
+        # Not a verdict the validator knows; kept verbatim as an audit record,
+        # which is what makes the original pause recognisable in a snapshot.
+        "verdict": "WELL-ACTUALLY-MAROONED",
+        "summary": "codex answered with a verdict nobody declared",
+        "findings": [],
+        "questions": [],
+        "context_requests": [],
+    }
+    INVALID_VERDICT_PAUSE = {
+        "reason": "INVALID_CODEX_REVIEW",
+        "detail": "codex review has an invalid verdict",
+    }
+
+    def pause_record(self, run_id):
+        return json.loads(
+            (self.run_directory(run_id) / "pause.json").read_text(encoding="utf-8")
+        )
+
+    def current_pause(self, run_id):
+        """The pause record, or None -- quoted into the first failure message so
+        that removing the gate shows the rewritten `pause.json`, not just an
+        exit code."""
+        path = self.run_directory(run_id) / "pause.json"
+        return self.pause_record(run_id) if path.exists() else None
+
+    def refuses_workflow(self, why):
+        """A workflow factory that fails the test if it is ever reached."""
+        def factory(**_kwargs):
+            raise AssertionError(why)
+
+        return factory
+
+    def assert_run_untouched(self, run_id, before, status, next_action):
+        """Byte-identical on disk, and still reporting the state it was in."""
+        self.assertEqual(self.run_snapshot(run_id), before)
+        code, stdout, stderr = self.cli("status", run_id)
+        self.assertEqual((code, stderr), (0, ""))
+        payload = json.loads(stdout)
+        self.assertEqual(payload["status"], status)
+        self.assertEqual(payload["next_action"], next_action)
+
+    def ready_doc_run(self):
+        """One initialised doc run: READY, nothing asked, nothing reviewed."""
+        self.write_doc()
+        code, stdout, stderr = self.init_doc()
+        self.assertEqual((code, stderr), (0, ""))
+        return json.loads(stdout)["run_id"]
+
+    def paused_doc_run(self):
+        """A doc run killed by an invalid Codex verdict, as a real one was."""
+        run_id = self.ready_doc_run()
+        codex = RecordingCodex([dict(self.INVALID_VERDICT_REVIEW)])
+        with patch("ai_review.cli.generate_outputs"):
+            code, stdout, stderr = self.cli(
+                "run", run_id, workflow_factory=self.doc_factory(codex),
+            )
+        self.assertEqual((code, stderr), (0, ""))
+        self.assertEqual(json.loads(stdout)["status"], "PAUSED")
+        self.assertEqual(self.pause_record(run_id), self.INVALID_VERDICT_PAUSE)
+        return run_id, codex
+
+    def reviewed_doc_run(self):
+        """A finished doc run parked on findings, waiting for its reader."""
+        run_id = self.ready_doc_run()
+        codex = RecordingCodex([self.doc_review("F-1")])
+        with patch("ai_review.cli.generate_outputs"):
+            code, stdout, stderr = self.cli(
+                "run", run_id, workflow_factory=self.doc_factory(codex),
+            )
+        self.assertEqual((code, stderr), (0, ""))
+        self.assertEqual(json.loads(stdout)["status"], "AWAITING_HUMAN_DOC_REVIEW")
+        return run_id, codex
+
+    def refused_answer(self, run_id, codex, mapping=None, name="answers.json"):
+        """Submit answers to a run that must refuse them, with the real workflow.
+
+        `generate_outputs` is stubbed only so that it can be asserted unused: a
+        command that did nothing must not rewrite the run's summary either.
+        """
+        payload = self.answers_file(mapping or {"Q-001": "答案一"}, name)
+        with patch("ai_review.cli.generate_outputs") as outputs:
+            code, stdout, stderr = self.cli(
+                "answer", run_id, "--answers", payload,
+                workflow_factory=self.doc_factory(codex),
+            )
+        self.assertEqual(
+            (code, stdout), (2, ""),
+            msg="pause.json is now %r" % (self.current_pause(run_id),),
+        )
+        self.assertNotIn("Traceback", stderr)
+        outputs.assert_not_called()
+        return stderr
+
+    def test_answering_a_paused_run_is_refused_and_keeps_the_pause_reason(self):
+        """The worst case: `pause.json` is the only record of why a run died."""
+        run_id, codex = self.paused_doc_run()
+        before = self.run_snapshot(run_id)
+
+        # A file that would otherwise be acceptable: the run's state, not the
+        # file, is what makes this wrong.
+        stderr = self.refused_answer(run_id, codex)
+
+        # The operator is told which state the run is actually in, and which
+        # one `answer` needs.
+        self.assertIn("PAUSED", stderr)
+        self.assertIn("AWAITING_USER_INPUT", stderr)
+        # The original reason survives: nothing was rewritten to blame the
+        # answers file for a run Codex killed.
+        self.assertEqual(self.pause_record(run_id), self.INVALID_VERDICT_PAUSE)
+        self.assertNotIn(
+            "INVALID_DOC_USER_ANSWER", json.dumps(self.pause_record(run_id))
+        )
+        self.assert_run_untouched(run_id, before, "PAUSED", "human_decision")
+        # No second Codex round was spent on a run that could not advance.
+        self.assertEqual(len(codex.calls), 1)
+
+    def test_answering_a_ready_run_is_refused_and_pauses_nothing(self):
+        """A run that has asked nothing yet must stay runnable, not become PAUSED."""
+        run_id = self.ready_doc_run()
+        codex = RecordingCodex([])
+        before = self.run_snapshot(run_id)
+        self.assertNotIn("pause.json", before)
+
+        stderr = self.refused_answer(run_id, codex)
+
+        self.assertIn("READY", stderr)
+        self.assertIn("AWAITING_USER_INPUT", stderr)
+        self.assertFalse((self.run_directory(run_id) / "pause.json").exists())
+        self.assert_run_untouched(run_id, before, "READY", "run")
+        self.assertEqual(codex.calls, [])
+
+    def test_answering_a_reviewed_doc_run_is_refused_and_pauses_nothing(self):
+        """A finished review awaiting its reader must survive a stray `answer`."""
+        run_id, codex = self.reviewed_doc_run()
+        before = self.run_snapshot(run_id)
+        self.assertNotIn("pause.json", before)
+
+        stderr = self.refused_answer(run_id, codex)
+
+        self.assertIn("AWAITING_HUMAN_DOC_REVIEW", stderr)
+        self.assertIn("AWAITING_USER_INPUT", stderr)
+        self.assertFalse((self.run_directory(run_id) / "pause.json").exists())
+        # Still re-reviewable: the human loop was not closed off by the refusal.
+        self.assert_run_untouched(
+            run_id, before, "AWAITING_HUMAN_DOC_REVIEW", "human_doc_review"
+        )
+        self.assertEqual(len(codex.calls), 1)
+
+    def test_the_status_gate_runs_before_any_workflow_is_built(self):
+        """Refused early, like the answers-file check: no workflow, no artifacts."""
+        run_id, _codex = self.paused_doc_run()
+        before = self.run_snapshot(run_id)
+        payload = self.answers_file({"Q-001": "答案一"})
+
+        code, stdout, stderr = self.cli(
+            "answer", run_id, "--answers", payload,
+            workflow_factory=self.refuses_workflow(
+                "answer must be refused before a workflow can re-pause the run"
+            ),
+        )
+
+        self.assertEqual((code, stdout), (2, ""))
+        self.assertIn("PAUSED", stderr)
+        self.assertEqual(self.pause_record(run_id), self.INVALID_VERDICT_PAUSE)
+        self.assertEqual(self.run_snapshot(run_id), before)
 
 
 class UserPresenceDialogRegressionTests(unittest.TestCase):

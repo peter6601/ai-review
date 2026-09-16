@@ -44,24 +44,33 @@ def _received(inputs: dict, phase: str) -> dict:
 
 def main() -> int:
     argv = sys.argv[1:]
+    # The scope is checked positionally and includes ``-m``: the model must be
+    # pinned by the caller, never inherited from ~/.codex/config.toml, so a
+    # run that omits it fails here rather than silently using whatever that
+    # global file names.
     if (
-        len(argv) < 12
+        len(argv) < 14
         or argv[:3] != ["-a", "never", "exec"]
-        or argv[3] != "-C"
-        or argv[5:7] != ["-s", "read-only"]
-        or argv[7] != "--output-schema"
-        or argv[9] != "-o"
+        or argv[3] != "-m"
+        or not argv[4]
+        or argv[5] != "-C"
+        or argv[7:9] != ["-s", "read-only"]
+        or argv[9] != "--output-schema"
+        or argv[11] != "-o"
     ):
         raise SystemExit("fake Codex received an invalid option scope")
-    output = Path(argv[10])
-    schema = argv[8]
-    prompt = argv[11]
+    model = argv[4]
+    output = Path(argv[12])
+    schema = argv[10]
+    prompt = argv[13]
     queue_path = Path(os.environ["AI_REVIEW_FAKE_QUEUE"])
     log_path = Path(os.environ["AI_REVIEW_FAKE_LOG"])
     entry = _pop(queue_path, "codex")
     inputs = _inputs(prompt)
     phase = _phase(inputs)
-    record = {"tool": "codex", "argv": argv, "schema": schema, "phase": phase}
+    record = {
+        "tool": "codex", "argv": argv, "schema": schema, "phase": phase, "model": model,
+    }
     # A queue entry is either a literal review or an envelope that also asserts
     # which phase and inputs this call was made with.
     if isinstance(entry, dict) and "output" in entry and set(entry) <= {

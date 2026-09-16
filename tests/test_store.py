@@ -569,6 +569,9 @@ class PolicyTests(unittest.TestCase):
             "production_line_limit": 100,
             "production_growth_percent": 30,
             "production_excludes": ["docs/**"],
+            "doc_max_initial_sources": 5,
+            "doc_max_context_tokens": 16000,
+            "codex_model": "gpt-5.6-sol",
         }
 
     def tearDown(self):
@@ -599,6 +602,119 @@ class PolicyTests(unittest.TestCase):
 
         with self.assertRaises(PolicyError):
             load_policy(self.write_policy(policy))
+
+    def test_doc_limits_are_loaded_from_the_shipped_defaults(self):
+        policy = load_policy(Path(__file__).parents[1] / "config" / "defaults.yaml")
+
+        self.assertEqual(policy.doc_max_initial_sources, 5)
+        self.assertEqual(policy.doc_max_context_tokens, 16000)
+
+    def test_missing_doc_limits_are_rejected(self):
+        for key in ("doc_max_initial_sources", "doc_max_context_tokens"):
+            with self.subTest(key=key):
+                policy = dict(self.policy)
+                del policy[key]
+
+                with self.assertRaises(PolicyError):
+                    load_policy(self.write_policy(policy))
+
+    def test_doc_sources_above_five_are_rejected(self):
+        policy = dict(self.policy)
+        policy["doc_max_initial_sources"] = 6
+
+        with self.assertRaises(PolicyError):
+            load_policy(self.write_policy(policy))
+
+    def test_doc_context_tokens_above_the_ceiling_are_rejected(self):
+        policy = dict(self.policy)
+        policy["doc_max_context_tokens"] = 24001
+
+        with self.assertRaises(PolicyError):
+            load_policy(self.write_policy(policy))
+
+    def test_codex_model_is_loaded_from_the_shipped_defaults(self):
+        """The tool states its own model requirement instead of inheriting one.
+
+        With no such key the Codex argv carried no ``-m``, so every run of
+        every kind silently took whatever ``~/.codex/config.toml`` named --
+        and one unrelated edit to that file broke all four kinds at once.
+        """
+        policy = load_policy(Path(__file__).parents[1] / "config" / "defaults.yaml")
+
+        self.assertEqual(policy.codex_model, "gpt-5.6-sol")
+
+    def test_missing_codex_model_is_rejected(self):
+        """Required, not optional-with-default: a default is the defect itself."""
+        policy = dict(self.policy)
+        del policy["codex_model"]
+
+        with self.assertRaises(PolicyError):
+            load_policy(self.write_policy(policy))
+
+    def test_codex_model_outside_the_argv_safe_allowlist_is_rejected(self):
+        """The value becomes one argv element, so it is allowlisted, not trusted.
+
+        It never reaches a shell, but a policy file is the wrong place to
+        accept arbitrary text: this module's job is refusing an unvalidated
+        limit, and a model name is no exception.
+        """
+        for value in (
+            "", " ", "\t", "\n", "gpt 5.6 sol", "gpt-5.6-sol ",
+            "gpt-5.6-sol; rm -rf /", "$(id)", "`id`", "gpt-5.6-sol|tee",
+            "gpt-5.6-sol\n", "gpt/5.6-sol", "gpt:5.6", "gpt@5.6",
+            5, 1.5, True, None, ["gpt-5.6-sol"], {"name": "gpt-5.6-sol"},
+        ):
+            with self.subTest(value=value):
+                policy = dict(self.policy)
+                policy["codex_model"] = value
+
+                with self.assertRaises(PolicyError):
+                    load_policy(self.write_policy(policy))
+
+    def test_a_policy_cannot_be_built_at_all_without_a_codex_model(self):
+        """Strictly required: no default exists that could stand in silently.
+
+        A hand-built ``Policy`` is how test fixtures reach the workflows, so
+        this is the boundary where a tolerated default would let the model go
+        unstated -- and an unstated model is the defect being closed.
+        """
+        from ai_review.policy import Policy
+
+        with self.assertRaises(TypeError):
+            Policy(
+                version=1, max_rounds=6, max_context_tokens=8000, max_initial_sources=3,
+                max_context_expansions=2, production_line_limit=100,
+                production_growth_percent=30, production_excludes=["docs/**"],
+                doc_max_initial_sources=5, doc_max_context_tokens=16000,
+            )
+
+    def test_shared_context_budget_keeps_its_own_ceiling(self):
+        policy = dict(self.policy)
+        policy["max_context_tokens"] = 16000
+
+        with self.assertRaises(PolicyError):
+            load_policy(self.write_policy(policy))
+
+    def test_context_limits_separate_doc_from_the_shared_kinds(self):
+        policy = load_policy(self.write_policy(self.policy))
+
+        for kind in ("plan", "code", "review"):
+            with self.subTest(kind=kind):
+                self.assertEqual(policy.context_limits(kind), (3, 8000))
+        self.assertEqual(policy.context_limits("doc"), (5, 16000))
+
+    def test_context_limits_refuse_a_kind_that_has_no_budget(self):
+        """An unknown kind is a bug, not a request for the shared pair.
+
+        Returning ``(3, 8000)`` for a misspelled or future kind is the silently
+        wrong budget this lookup exists to prevent, so it raises instead.
+        """
+        policy = load_policy(self.write_policy(self.policy))
+
+        for kind in ("plan_typo", "docs", "DOC", "", None):
+            with self.subTest(kind=kind):
+                with self.assertRaises(PolicyError):
+                    policy.context_limits(kind)
 
 
 class RunStoreTests(unittest.TestCase):
