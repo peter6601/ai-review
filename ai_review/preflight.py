@@ -42,7 +42,7 @@ _LOCATION = re.compile(r"^(?P<path>[^\x00:]+):(?P<line>[0-9]{1,9})$")
 
 
 class PreflightError(ValueError):
-    """A specialist submission is malformed, oversized, or unbound."""
+    """A specialist submission is malformed or oversized."""
 
 
 def load_preflight_text(contents: str) -> Any:
@@ -107,21 +107,10 @@ def _validated_finding(value: Any, specialist: str) -> dict:
     }
 
 
-def validate_preflight(payload: Any, *, patch_digest: str) -> dict:
-    """Return the one normalized submission bound to this exact patch digest."""
-    if not re.fullmatch(r"[0-9a-f]{64}", patch_digest or ""):
-        raise PreflightError("preflight patch digest binding is invalid")
-    if not isinstance(payload, dict) or set(payload) != {
-        "profile", "patch_digest", "specialists",
-    }:
+def validate_preflight(payload: Any) -> dict:
+    """Return the one normalized submission, ordered by required specialist."""
+    if not isinstance(payload, dict) or set(payload) != {"specialists"}:
         raise PreflightError("preflight submission has unknown or missing keys")
-    if payload["profile"] != "ios":
-        raise PreflightError("preflight submission requires the ios profile")
-    submitted = payload["patch_digest"]
-    if not isinstance(submitted, str) or not re.fullmatch(r"[0-9a-f]{64}", submitted):
-        raise PreflightError("preflight patch digest must be SHA-256 hex")
-    if submitted != patch_digest:
-        raise PreflightError("preflight patch digest does not match the awaiting patch")
     specialists = payload["specialists"]
     if not isinstance(specialists, list) or len(specialists) != len(REQUIRED_SPECIALISTS):
         raise PreflightError("preflight submission requires exactly three specialists")
@@ -149,8 +138,6 @@ def validate_preflight(payload: Any, *, patch_digest: str) -> dict:
     if set(normalized) != set(REQUIRED_SPECIALISTS):
         raise PreflightError("preflight submission must cover every required specialist")
     return {
-        "profile": "ios",
-        "patch_digest": patch_digest,
         "specialists": [
             {"name": name, "findings": normalized[name]}
             for name in REQUIRED_SPECIALISTS

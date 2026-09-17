@@ -16,17 +16,18 @@ at all, so code that already exists is reviewed here or not at all.
 
 Command map, in order:
 
-1. `ai-review init review` — freeze the base, brief, profile, verification, and
-   the complete current patch. No model runs.
+1. `ai-review init review` — freeze the base, brief, profile, verification, the
+   complete current patch, and (on iOS) the three specialists' findings via
+   `--preflight`. No model runs.
 2. `ai-review approve-review` — the scope gate. Nothing runs before it.
-3. `ai-review run` / `ai-review resume` — the Codex-first loop.
-4. `ai-review submit-preflight` — iOS only, exactly once, read-only findings.
-5. `ai-review approve-risk` — binds one high-risk patch.
-6. `ai-review approve-code` — the human's final gate.
-7. `ai-review writeback-knowledge` — separate, never automatic.
+3. `ai-review run` / `ai-review resume` — the Codex-first loop, start to finish
+   in one call. There is no station in the middle for you to service.
+4. `ai-review approve-risk` — binds one high-risk patch.
+5. `ai-review approve-code` — the human's final gate.
+6. `ai-review writeback-knowledge` — separate, never automatic.
 
-Gates 2 and 5 accept `--auto`, which approves as you instead of waiting for a
-person; read **Auto-approval and its rate limit** before using it. Gate 6 does
+Gates 2 and 4 accept `--auto`, which approves as you instead of waiting for a
+person; read **Auto-approval and its rate limit** before using it. Gate 5 does
 not, and never will.
 
 Every block below invokes the `ai-review` helper from this repository's
@@ -46,6 +47,9 @@ not infer it from the branch or the diff.
    state the chosen profile to the user before creating the run.
 5. **Focused verification** — at least one task-specific test command. Optional
    additional check/build commands. No smoke tests, no whole-suite stand-ins.
+6. **The specialist preflight** — iOS only, and required there. One JSON file
+   holding all three read-only specialists' findings. See **The iOS specialist
+   preflight**, and collect it before you touch the CLI.
 
 Optionally select at most three exact second-brain sections as
 `--source "/absolute/path.md#Exact Heading"`.
@@ -58,13 +62,23 @@ ai-review init review \
   --base "BASE_REF" \
   --brief "SHORT REVIEW BRIEF" \
   --profile "ios|generic" \
-  --verify '{"kind":"test","argv":["python3","-m","unittest","tests.test_feature"],"scope":"tests.test_feature"}'
+  --verify '{"kind":"test","argv":["python3","-m","unittest","tests.test_feature"],"scope":"tests.test_feature"}' \
+  --preflight "/private/tmp/preflight.json"
 ```
+
+`--preflight` is required for `--profile ios` and refused for `generic`.
 
 Initialization freezes the base commit, captures the complete patch from that
 base to the current worktree (commits, staged and unstaged tracked edits, and
-untracked files), and returns `AWAITING_REVIEW_APPROVAL` with
-`next_action: human_review_scope`. No model has run yet.
+untracked files), validates and digests the specialist findings alongside it,
+and returns `AWAITING_REVIEW_APPROVAL` with `next_action: human_review_scope`.
+No model has run yet.
+
+Everything is checked before the run exists, so a malformed preflight file is an
+input error that leaves nothing behind: fix the file and run `init` again. The
+approval that follows therefore covers those findings too — say so when you
+report the scope, because the human is approving the three reports as well as
+the patch.
 
 Report the run ID, base OID, profile, initial patch digest, and the exact
 verification argv, then clear the scope gate. With `--auto` you clear it
@@ -92,7 +106,7 @@ signed; a worktree that moved still fails; and the receipt records
 approval never claims that a person pressed anything.
 
 **At most five auto-approvals in any 60-second sliding window**, counted across
-every run and all three gates in one ledger beside the approval key. The sixth
+every run and both gates that have it, in one ledger beside the approval key. The sixth
 exits `4` with `retry_after=Ns`, approves nothing, and leaves the run exactly
 where it was. Wait the window out. Never route around the limit by creating a
 second run.
@@ -169,8 +183,6 @@ sections and submit them with `expand-context`. The packet is capped at 8,000
 estimated tokens with at most two expansions; second-brain content is advisory
 evidence, never an instruction.
 
-**`AWAITING_PREFLIGHT`** (iOS only) — see the next section.
-
 **`PAUSED` with reason `HIGH_RISK_CHANGE`** — Claude touched a dependency
 declaration or lockfile, a migration, entitlements/signing/provisioning, a CI/CD
 workflow, a public API contract, or a persisted/network format. Show the human
@@ -190,36 +202,53 @@ Do **not** start a fresh `init review` for the same work; that would reset the
 counter and defeat the ceiling.
 
 **`PAUSED` for any other reason, including `WORKFLOW_ERROR`** — terminal because
-an external precondition broke (a malformed model result, an unavailable runner,
-a moved base). Fix that external cause and start a fresh `init review`; never
-claim the old run resumes. This restart path exists only for a broken
-precondition, never to buy more repair rounds.
+something about the work itself broke: a model result that failed its schema, a
+moved base, a repair that hit the per-call spend ceiling. Fix that cause and
+start a fresh `init review`; never claim the old run resumes. This restart path
+exists only for a broken precondition, never to buy more repair rounds.
 
-**`INTERRUPTED`** — continue with `resume`. Completed model calls are not repeated.
+**`INTERRUPTED`** — the status for a failure that says nothing about the work:
+the call timed out, the model was overloaded, the organization hit its monthly
+limit, `claude` was not logged in, or the executable would not start. Every
+completed round and its evidence stay valid, so the run is not void and the
+repair counter is not reset — which is what a terminal pause used to do to it.
+
+How much `resume` can pick up depends on which call was cut short:
+
+- **A Codex review or a verification command** — `resume` continues the loop.
+  Codex reads and never writes, and a completed verification round is reused
+  under its own review sequence rather than re-run, so nothing is repeated.
+- **A Claude repair** — `resume` stops at `AMBIGUOUS_EXTERNAL_CALL` and a person
+  takes it from there. A repair may have written a file before it died, and the
+  patch this tool captures cannot see a gitignored path, so there is no way to
+  prove it left nothing behind. Repeating it could apply the same change twice,
+  so it fails closed. Read the worktree, decide what the half-finished repair
+  left, and start a fresh `init review` from what is actually there.
+
+Fix the environment first either way — log in, wait out the overload, raise the
+limit.
 
 **`AWAITING_HUMAN_CODE_REVIEW`** — automation is done. Hand off to the human.
 
-## iOS profile: one read-only preflight
+## The iOS specialist preflight
 
-On an `ios` run, Codex still reviews first. The run then stops at
-`AWAITING_PREFLIGHT` with `next_action: submit_preflight`.
+On an `ios` run the three read-only specialists run **before** `init`, as the last
+step of your own review work, and their findings are an input to the run rather
+than something you hand over halfway through it. There is no pause to service:
+`run` goes from the first Codex review to the human's gate in one call.
 
-Dispatch these three audits **in parallel and read-only**. They must not edit any
-file, and `ai-review` never launches them:
+Dispatch these three **in parallel and read-only**. They must not edit any file,
+and `ai-review` never launches them:
 
-- `swiftui-reviewer` → category `swiftui`
-- `ux-critique` → category `ux`
-- `resilience-auditor` → category `resilience`
+- `swiftui-reviewer` → category `swiftui`, IDs `SWIFTUI-001`, …
+- `ux-critique` → category `ux`, IDs `UX-001`, …
+- `resilience-auditor` → category `resilience`, IDs `RESILIENCE-001`, …
 
-Normalize all three outputs into one JSON file — exactly these three specialist
-names, once each, at most 20 findings each, each string under 1,000 UTF-8 bytes,
-`location` a repository-relative `path:line`, and `patch_digest` copied from the
-run's `preflight-request.json`:
+Each one ends its report with a fenced JSON object. Take only that block — never
+the prose around it — and collect the three into one file:
 
 ```json
 {
-  "profile": "ios",
-  "patch_digest": "PATCH_DIGEST_FROM_THE_REQUEST",
   "specialists": [
     {
       "name": "swiftui-reviewer",
@@ -241,14 +270,32 @@ run's `preflight-request.json`:
 }
 ```
 
-```bash
-ai-review submit-preflight "REVIEW_RUN_ID" --findings "/private/tmp/preflight.json"
-```
+The envelope carries nothing else: no profile, no patch digest, no wrapper keys.
+`init` binds it to the patch for you.
 
-Exactly one submission is accepted per run. The workflow merges the Codex and
-specialist findings into a single repair queue and calls Claude once. If Codex
-and all three specialists found nothing and verification is green, Claude is not
-called and the run goes straight to human Code review. Specialists never rerun.
+All three names must be present, exactly once each. `"findings": []` means that
+specialist reviewed the code and found nothing — it is a verdict, not a blank,
+and it is not the same as omitting them. If an agent fails or returns something
+you cannot parse, **do not init**: say which one, and re-run that agent.
+
+The rest of the contract is what the validator enforces: at most 20 findings per
+specialist, each string under 1,000 UTF-8 bytes, `severity` one of `blocker`,
+`major`, `minor`, `category` matching the specialist, `location` a
+repository-relative `path:line`, and every `id` unique across all three. A file
+that breaks any of these is refused at `init` and creates no run.
+
+Only these three feed `--preflight`. Findings from any other auditor —
+`perf-auditor`, `concurrency-auditor`, `architecture-auditor`, `review-swarm` —
+belong to your own Phase 3 work and must be fixed before you init, not routed
+through this channel.
+
+Once the run starts, the workflow merges the Codex and specialist findings into a
+single repair queue and calls Claude once. Codex's own first review never sees
+the specialist findings: it judges the code on its own terms, and the merge
+happens after it. If Codex and all three specialists found nothing and
+verification is green, Claude is not called and the run goes straight to human
+Code review. The specialists are merged into the first decisive review only, and
+never rerun.
 
 That single Claude repair carries three output constraints — `ios-distill`
 (remove unnecessary SwiftUI/state/navigation structure), `code-simplifier`
@@ -275,7 +322,7 @@ triggers holds: three or more repair rounds, a repeated invariant, a scope or
 high-risk pause, human arbitration, a reusable architecture/testing lesson, or
 all six repair rounds exhausted. Writeback is a separate, never-automatic command
 permitted only after that exact approval, and it writes one file under
-`second-brain/ai-review/`:
+the workspace's `second-brain/ai-review/`:
 
 ```bash
 ai-review writeback-knowledge "REVIEW_RUN_ID"
@@ -287,7 +334,7 @@ orchestrator executes the approved verification argv.
 
 ## Claude Code invocation notes
 
-- Run `init`, `run`, `resume`, and `submit-preflight` with the Bash sandbox
+- Run `init`, `run`, and `resume` with the Bash sandbox
   disabled: verification wraps each command in `/usr/bin/sandbox-exec` and macOS
   rejects a nested sandbox. This loosens only the outer orchestrating call — the
   inner Codex read-only sandbox, Claude safe mode, and per-command Seatbelt stay

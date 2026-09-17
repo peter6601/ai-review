@@ -8,6 +8,7 @@ Claude may edit the worktree.
 """
 
 import hashlib
+import json
 import re
 import subprocess
 from pathlib import Path
@@ -15,8 +16,7 @@ from typing import Any, Iterable, Mapping, Optional
 
 from .models import ReviewManifest, RunState, Status, verify_risk_approval
 from .preflight import (
-    REQUIRED_SPECIALISTS, deduplicated, merged_source_ids, normalized_findings,
-    submission_risk_flags, validate_preflight,
+    deduplicated, normalized_findings, submission_risk_flags, validate_preflight,
 )
 from .process_security import run_git
 from .review_risk import (
@@ -66,110 +66,87 @@ class DirectReviewWorkflow(CodeWorkflow):
         self._consume_risk_approval(run_id)
         state = self.store.load(run_id)
         if state.status == Status.AWAITING_PREFLIGHT:
-            # Only submit-preflight may leave this gate.
+            # Retiring `submit-preflight` removed the only way out of this gate;
+            # it did not open the gate.  The runs already parked here were
+            # created under a contract this code no longer implements, and their
+            # `awaiting_preflight` journal would make the pending-review scan
+            # skip the very round that holds the findings.
             return state
         return super().run(run_id)
-
-    def submit_preflight(self, run_id: str, payload: Any) -> RunState:
-        """Accept the one read-only specialist submission, then continue the loop."""
-        state = self.store.load(run_id)
-        self._validate_state(state)
-        if state.manifest.profile != "ios":
-            raise WorkflowError("only an ios Review run collects a specialist preflight")
-        if state.status != Status.AWAITING_PREFLIGHT:
-            raise WorkflowError("Review is not awaiting a specialist preflight")
-        artifacts = self._artifacts(state)
-        if self.store.artifact_exists(artifacts / "preflight.json"):
-            raise WorkflowError("a specialist preflight was already submitted")
-        request = self._read_json(artifacts / "preflight-request.json")
-        # The specialists are read-only, but the worktree was reachable while the
-        # run waited. Recapture before accepting findings: otherwise a file added
-        # during the preflight would ride to a human PASS gate unreviewed by Codex.
-        reviewed = self.store.read_artifact_bytes(
-            artifacts / "patches" / ("round-%04d.patch" % 0)
-        )
-        if not self._current_worktree_matches(state, reviewed):
-            raise WorkflowError(
-                "worktree changed during the specialist preflight; "
-                "Codex has not reviewed the current patch"
-            )
-        submission = validate_preflight(payload, patch_digest=request["patch_digest"])
-        self._write_json(artifacts / "preflight.json", submission)
-        self._write_json(
-            artifacts / "preflight-normalized.json",
-            {
-                "findings": list(normalized_findings(submission)),
-                # Merged lenses keep an auditable trail back to every source ID.
-                "source_ids": merged_source_ids(submission),
-            },
-        )
-        self._set_running(state)
-        self.store.save(state)
-        return self.run(run_id)
 
     def _handle_code_review(
         self, state: RunState, artifacts: Path, sequence: int, raw_review: Any
     ) -> None:
-        action = artifacts / "code-review-actions" / ("%04d.json" % sequence)
-        if self._gate_on_preflight(state, artifacts, sequence, action, raw_review):
+        merged = artifacts / "merged-reviews" / ("%04d.json" % sequence)
+        if self.store.artifact_exists(merged):
+            # A replayed round re-enters with the *raw* persisted Codex review,
+            # which the merge replaced.  The specialist findings live only in
+            # the merged decision, so replaying the raw one would drop them.
+            super()._handle_code_review(state, artifacts, sequence, self._read_json(merged))
             return
-        if self._preflight_gate_satisfied(state, artifacts, action):
-            self._resolve_gated_review(state, artifacts, sequence, action, raw_review)
+        if self._merges_specialists(state, artifacts, raw_review):
+            self._merge_specialist_findings(state, artifacts, sequence, raw_review)
             return
         super()._handle_code_review(state, artifacts, sequence, raw_review)
 
-    def _gate_on_preflight(
-        self, state: RunState, artifacts: Path, sequence: int, action: Path, raw_review: Any,
+    def _merges_specialists(
+        self, state: RunState, artifacts: Path, raw_review: Any
     ) -> bool:
-        """Stop the first decisive iOS Codex review until specialists have run."""
+        """True for the one review the frozen specialist findings belong to.
+
+        The specialists judged the round-zero patch, so their findings belong to
+        the first decisive review of it and to no later round.  ``merged-reviews``
+        is the durable record of that having happened, which keeps the rule true
+        across a resume.
+        """
         if state.manifest.profile != "ios":
             return False
-        if self.store.artifact_exists(artifacts / "preflight.json"):
+        # The manifest, not an artifact, decides whether this run has a
+        # preflight: an artifact can be removed after the human signed for it,
+        # and a missing one must fail closed rather than skip the merge.
+        if state.manifest.preflight_digest is None:
             return False
-        if self.store.artifact_exists(action):
+        if self.store.list_artifacts(artifacts / "merged-reviews", ".json"):
             return False
         try:
             review = validate_codex_review(raw_review)
         except (TypeError, ValueError):
-            # Malformed output is not a gate; the shared handler pauses on it.
+            # Malformed output is not a merge point; the shared handler pauses.
             return False
-        if review["verdict"] not in ("PASS", "CHANGES_REQUIRED"):
-            return False
-        patch_digest = self._round_patch_digest(artifacts, 0)
-        self._write_json(artifacts / "preflight-request.json", {
-            "status": "pending",
-            "review_sequence": sequence,
-            "patch_digest": patch_digest,
-            "profile": "ios",
-            "read_only": True,
-            "specialists": list(REQUIRED_SPECIALISTS),
-        })
-        self._write_json(action, {
-            "action": "awaiting_preflight",
-            "review_sequence": sequence,
-            "patch_digest": patch_digest,
-        })
-        self._set_status(state, Status.AWAITING_PREFLIGHT)
-        self.store.save(state)
-        return True
+        return review["verdict"] in ("PASS", "CHANGES_REQUIRED")
 
-    def _preflight_gate_satisfied(
-        self, state: RunState, artifacts: Path, action: Path
-    ) -> bool:
-        if state.manifest.profile != "ios":
-            return False
-        if not self.store.artifact_exists(artifacts / "preflight.json"):
-            return False
-        if not self.store.artifact_exists(action):
-            return False
-        return self._read_json(action).get("action") == "awaiting_preflight"
+    def _signed_specialist_findings(
+        self, state: RunState, artifacts: Path
+    ) -> list[dict]:
+        """Return the findings the human's approval actually covers.
 
-    def _resolve_gated_review(
-        self, state: RunState, artifacts: Path, sequence: int, action: Path, raw_review: Any,
+        The derived ``preflight-normalized.json`` is a convenience, not the
+        contract: the contract is ``preflight.json`` matching the
+        ``preflight_digest`` frozen into the signed manifest.  The findings are
+        recomputed from that source every time, so tampering with, or deleting,
+        the derived artifact cannot quietly drop an approved finding.
+        """
+        expected = state.manifest.preflight_digest
+        raw = self._read_json(artifacts / "preflight.json", default=None)
+        if raw is None:
+            raise WorkflowError("approved specialist preflight is missing")
+        digest = hashlib.sha256(
+            json.dumps(raw, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        if digest != expected:
+            raise WorkflowError("specialist preflight does not match the approved digest")
+        try:
+            submission = validate_preflight(raw)
+        except ValueError as error:
+            raise WorkflowError("approved specialist preflight is malformed") from error
+        return list(normalized_findings(submission))
+
+    def _merge_specialist_findings(
+        self, state: RunState, artifacts: Path, sequence: int, raw_review: Any,
     ) -> None:
         """Merge Codex and specialist findings into one decision for this round."""
         review = validate_codex_review(raw_review)
-        specialist = self._read_json(artifacts / "preflight-normalized.json")["findings"]
+        specialist = self._signed_specialist_findings(state, artifacts)
         merged = deduplicated([*review["findings"], *specialist])
         decision = {
             "verdict": "CHANGES_REQUIRED" if merged else "PASS",
@@ -185,24 +162,9 @@ class DirectReviewWorkflow(CodeWorkflow):
         self._write_json(
             artifacts / "merged-reviews" / ("%04d.json" % sequence), decision
         )
-        # The gate is consumed: hand the merged decision to the shared handler so
-        # a PASS, a repair, and the resume journal all keep their normal shape.
-        self.store.remove_artifact(action)
+        # Hand the merged decision to the shared handler so a PASS, a repair, and
+        # the resume journal all keep their normal shape.
         super()._handle_code_review(state, artifacts, sequence, decision)
-
-    def _pending_code_review(
-        self, state: RunState, artifacts: Path
-    ) -> tuple[int, Optional[Any]]:
-        for path in self.store.list_artifacts(artifacts / "reviews", ".json"):
-            sequence = int(path.stem)
-            action = artifacts / "code-review-actions" / ("%04d.json" % sequence)
-            if (
-                self.store.artifact_exists(action)
-                and self._read_json(action).get("action") == "awaiting_preflight"
-                and self.store.artifact_exists(artifacts / "preflight.json")
-            ):
-                return sequence, self._read_json(path)
-        return super()._pending_code_review(state, artifacts)
 
     def _round_patch_digest(self, artifacts: Path, round_number: int) -> str:
         patch = self.store.read_artifact_bytes(

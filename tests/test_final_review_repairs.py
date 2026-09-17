@@ -79,8 +79,8 @@ class FinalReviewRepairContracts(unittest.TestCase):
                 ])
 
     def test_claude_tool_boundaries_are_mode_specific_and_bash_free(self):
-        plan = build_claude_argv("{}", "prompt", mode="plan")
-        code = build_claude_argv("{}", "prompt", mode="code")
+        plan = build_claude_argv("{}", "prompt", mode="plan", model="opus[1m]", fallback_model="sonnet", max_budget_usd=5)
+        code = build_claude_argv("{}", "prompt", mode="code", model="opus[1m]", fallback_model="sonnet", max_budget_usd=5)
         for argv in (plan, code):
             self.assertIn("--safe-mode", argv)
             self.assertIn("--tools", argv)

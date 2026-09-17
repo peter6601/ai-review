@@ -104,6 +104,9 @@ class CodeWorkflowTests(unittest.TestCase):
             doc_max_initial_sources=5,
             doc_max_context_tokens=16000,
             codex_model="gpt-5.6-sol",
+            claude_model="opus[1m]",
+            claude_fallback_model="sonnet",
+            claude_max_budget_usd=5,
         )
         plan = self.store.create(RunState.new(
             "plan", str(self.plan), str(self.repo), self.base,
@@ -156,8 +159,11 @@ class CodeWorkflowTests(unittest.TestCase):
                 codex=FakeCodex([]), claude=FakeClaude([{"summary": "initial"}]), verification=interrupted,
             ).run(self.run.run_id)
 
-        self.assertEqual(self.store.load(self.run.run_id).status, Status.PAUSED)
-        self.assertEqual(json.loads((self.artifacts / "pause.json").read_text())["reason"], "RUNNER_INTERRUPTED")
+        self.assertEqual(self.store.load(self.run.run_id).status, Status.INTERRUPTED)
+        self.assertEqual(
+            json.loads((self.artifacts / "interruption.json").read_text())["reason"],
+            "RUNNER_INTERRUPTED",
+        )
 
     def test_first_green_pass_stops(self):
         codex = FakeCodex([review("PASS"), review("CHANGES_REQUIRED", findings=[blocker("later")])])
@@ -217,9 +223,9 @@ class CodeWorkflowTests(unittest.TestCase):
             workflow.answer(self.run.run_id, {"Q-001": "Local"})
 
         persisted = self.store.load(self.run.run_id)
-        self.assertEqual(persisted.status, Status.PAUSED)
+        self.assertEqual(persisted.status, Status.INTERRUPTED)
         self.assertEqual(
-            json.loads((self.artifacts / "pause.json").read_text())["reason"],
+            json.loads((self.artifacts / "interruption.json").read_text())["reason"],
             "RUNNER_INTERRUPTED",
         )
 
@@ -322,7 +328,155 @@ class CodeWorkflowTests(unittest.TestCase):
         self.assertEqual(result.status, Status.AWAITING_HUMAN_CODE_REVIEW)
         self.assertEqual(codex.calls[0]["base_oid"], self.base)
 
-    def test_codex_intent_without_raw_result_pauses_without_recall(self):
+    def test_a_claude_repair_is_never_replayed_even_with_a_matching_digest(self):
+        """The digest cannot see gitignored files, and Claude may write them.
+
+        `capture_diff_bytes` builds on `ls-files --others --exclude-standard`,
+        so an edit to an ignored path leaves the digest unchanged.  A repair
+        that died after writing one would be repeated, applying the change
+        twice while the counter recorded it once.  Read-only calls have no such
+        exposure, so only they are replayable.
+        """
+        repo = self.repo
+        (repo / ".gitignore").write_text("runtime.json\n", encoding="utf-8")
+        self.git("add", ".gitignore")
+        self.git("commit", "-qm", "ignore runtime")
+
+        class WritesIgnoredThenDies(FakeClaude):
+            def repair(self, inputs):
+                (repo / "runtime.json").write_text('{"written": true}\n', encoding="utf-8")
+                raise KeyboardInterrupt()
+
+        crashing = WritesIgnoredThenDies(implementations=[{"summary": "initial"}])
+        with self.assertRaises(KeyboardInterrupt):
+            self.workflow(
+                codex=FakeCodex([review("CHANGES_REQUIRED", findings=[blocker("CODE-001")])]),
+                claude=crashing,
+                verification=lambda *_a, **_k: verification(exit_code=0),
+            ).run(self.run.run_id)
+
+        resumed = FakeClaude(repairs=[repair_result("CODE-001")])
+        result = self.workflow(
+            codex=FakeCodex([review("PASS")]), claude=resumed,
+            verification=lambda *_a, **_k: verification(exit_code=0),
+        ).run(self.run.run_id)
+
+        self.assertEqual(result.status, Status.PAUSED)
+        self.assertEqual(result.pause_reason, "AMBIGUOUS_EXTERNAL_CALL")
+        self.assertEqual(len(resumed.repair_calls), 0)
+
+    def test_a_resumed_round_reuses_its_verification_instead_of_renumbering(self):
+        """Regression: the two counters advanced independently across a resume.
+
+        Verification 0001 ran, Codex was interrupted before writing its review,
+        and the resume produced verification 0002 while retrying review 0001 —
+        so the round was judged against one snapshot and recorded against
+        another.
+        """
+        rounds = []
+
+        def verify(*_args, **_kwargs):
+            rounds.append(1)
+            return verification(exit_code=0)
+
+        class CrashingCodex(FakeCodex):
+            def review(self, inputs):
+                super().review(inputs)
+                raise KeyboardInterrupt()
+
+        with self.assertRaises(KeyboardInterrupt):
+            self.workflow(
+                codex=CrashingCodex([review("PASS")]),
+                claude=FakeClaude(implementations=[{"summary": "initial"}]),
+                verification=verify,
+            ).run(self.run.run_id)
+        self.assertEqual(len(rounds), 1)
+
+        result = self.workflow(
+            codex=FakeCodex([review("PASS")]), claude=FakeClaude(), verification=verify,
+        ).run(self.run.run_id)
+
+        self.assertEqual(result.status, Status.AWAITING_HUMAN_CODE_REVIEW)
+        # One round, one snapshot: the resume reused it rather than re-running
+        # the commands and filing the answer under a new number.
+        self.assertEqual(
+            sorted(path.name for path in (self.artifacts / "verification-rounds").iterdir()),
+            ["0001.json"],
+        )
+        self.assertEqual(
+            sorted(path.name for path in (self.artifacts / "reviews").iterdir()),
+            ["0001.json"],
+        )
+        self.assertEqual(len(rounds), 1)
+
+    def test_an_overloaded_repair_interrupts_and_still_refuses_to_replay(self):
+        """An interruption preserves the run; it does not make a repair repeatable.
+
+        `Status.INTERRUPTED` keeps every completed round and its evidence valid
+        instead of voiding the run, which is what a terminal pause used to do.
+        It does not license repeating the mutating call that was cut short: the
+        patch digest cannot see a gitignored write, so the repair round still
+        fails closed and a person picks it up.
+        """
+        from ai_review.runners import ExternalEnvironmentError
+
+        class OverloadedOnce(FakeClaude):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.failed = False
+
+            def repair(self, inputs):
+                if not self.failed:
+                    self.failed = True
+                    raise ExternalEnvironmentError("EXTERNAL_OVERLOADED exit=1")
+                return super().repair(inputs)
+
+        claude = OverloadedOnce(
+            implementations=[{"summary": "initial"}],
+            repairs=[{
+                "summary": "repaired",
+                "resolutions": [{
+                    "finding_id": "CODE-001", "outcome": "fixed", "evidence": "restored",
+                }],
+            }],
+        )
+        workflow = self.workflow(
+            codex=FakeCodex([
+                review("CHANGES_REQUIRED", findings=[blocker("CODE-001")]), review("PASS"),
+            ]),
+            claude=claude,
+            verification=lambda *_args, **_kwargs: verification(exit_code=0),
+        )
+
+        with self.assertRaises(ExternalEnvironmentError):
+            workflow.run(self.run.run_id)
+        interrupted = self.store.load(self.run.run_id)
+
+        # Interrupted, not voided: the round that finished is still on disk and
+        # the failure is recorded as an environment problem, not a workflow one.
+        self.assertEqual(interrupted.status, Status.INTERRUPTED)
+        self.assertEqual(
+            json.loads((self.artifacts / "interruption.json").read_text())["reason"],
+            "RUNNER_INTERRUPTED",
+        )
+        self.assertTrue((self.artifacts / "reviews" / "0001.json").exists())
+
+        resumed = workflow.run(self.run.run_id)
+
+        # The mutating call is never repeated on the strength of a digest that
+        # cannot see every file it could have written.
+        self.assertEqual(resumed.status, Status.PAUSED)
+        self.assertEqual(resumed.pause_reason, "AMBIGUOUS_EXTERNAL_CALL")
+        self.assertEqual(len(claude.implement_calls), 1)
+
+    def test_a_codex_intent_replays_only_while_the_worktree_is_unchanged(self):
+        """Codex reads; replaying it is safe exactly while nothing has moved.
+
+        The intent records the worktree digest it was written under.  Equal means
+        the interrupted call left nothing behind and the review can be asked for
+        again; different means something happened that this run cannot account
+        for, and it stays ambiguous.
+        """
         class CrashingCodex(FakeCodex):
             def review(self, inputs):
                 super().review(inputs)
@@ -334,6 +488,56 @@ class CodeWorkflowTests(unittest.TestCase):
         )
         with self.assertRaises(KeyboardInterrupt):
             crashing.run(self.run.run_id)
+        # The worktree is untouched, so the read-only review is asked again.
+        replacement = FakeCodex([review("PASS")])
+        result = self.workflow(
+            codex=replacement, claude=FakeClaude(), verification=lambda *_args, **_kwargs: verification(),
+        ).run(self.run.run_id)
+
+        self.assertEqual(result.status, Status.AWAITING_HUMAN_CODE_REVIEW)
+        self.assertEqual(replacement.call_count, 1)
+
+    def test_an_intent_written_before_the_digest_existed_still_fails_closed(self):
+        class CrashingCodex(FakeCodex):
+            def review(self, inputs):
+                super().review(inputs)
+                raise KeyboardInterrupt()
+
+        crashing = self.workflow(
+            codex=CrashingCodex([review("PASS")]), claude=FakeClaude([{"summary": "initial"}]),
+            verification=lambda *_args, **_kwargs: verification(),
+        )
+        with self.assertRaises(KeyboardInterrupt):
+            crashing.run(self.run.run_id)
+        intent = next((self.artifacts / "codex-intents").glob("*.json"))
+        record = json.loads(intent.read_text(encoding="utf-8"))
+        del record["patch_digest"]
+        intent.write_text(json.dumps(record), encoding="utf-8")
+
+        replacement = FakeCodex([review("PASS")])
+        result = self.workflow(
+            codex=replacement, claude=FakeClaude(), verification=lambda *_args, **_kwargs: verification(),
+        ).run(self.run.run_id)
+
+        self.assertEqual(result.status, Status.PAUSED)
+        self.assertEqual(result.pause_reason, "AMBIGUOUS_EXTERNAL_CALL")
+        self.assertEqual(replacement.call_count, 0)
+
+    def test_a_moved_worktree_keeps_an_unfinished_intent_ambiguous(self):
+        class CrashingCodex(FakeCodex):
+            def review(self, inputs):
+                super().review(inputs)
+                raise KeyboardInterrupt()
+
+        crashing = self.workflow(
+            codex=CrashingCodex([review("PASS")]), claude=FakeClaude([{"summary": "initial"}]),
+            verification=lambda *_args, **_kwargs: verification(),
+        )
+        with self.assertRaises(KeyboardInterrupt):
+            crashing.run(self.run.run_id)
+        # Something edited the worktree while the call was in flight.
+        (self.repo / "Sneaked.py").write_text("SNEAKED = True\n", encoding="utf-8")
+
         replacement = FakeCodex([review("PASS")])
         result = self.workflow(
             codex=replacement, claude=FakeClaude(), verification=lambda *_args, **_kwargs: verification(),

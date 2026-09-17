@@ -471,7 +471,7 @@ class DocWorkflow(PlanWorkflow):
             # state; only the original immutable answers can be retried.
             raise
         except RunnerInterrupted as error:
-            self._pause_loaded(state, "RUNNER_INTERRUPTED", str(error))
+            self._interrupt_loaded(state, "RUNNER_INTERRUPTED", str(error))
             raise
         except Exception as error:
             return self._pause_loaded(state, "INVALID_DOC_USER_ANSWER", str(error))

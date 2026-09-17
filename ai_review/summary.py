@@ -678,11 +678,14 @@ def _collect_preflight(store: RunStore, artifacts: Path, evidence: _Evidence) ->
     value = _read_json(store, path, "preflight.json", evidence)
     if value is None:
         return
+    # `init review --preflight` freezes `{"specialists": [...]}` and nothing
+    # else: the profile is already in the manifest and the patch binding moved
+    # to `preflight_digest`.  The retired envelope carried both, and reading it
+    # here is refused rather than tolerated, so a stale writer is visible
+    # instead of silently producing a summary bound to the wrong contract.
     if (
         not isinstance(value, dict)
-        or set(value) != {"profile", "patch_digest", "specialists"}
-        or value["profile"] != "ios"
-        or not _DIGEST.fullmatch(value["patch_digest"] if isinstance(value["patch_digest"], str) else "")
+        or set(value) != {"specialists"}
         or not isinstance(value["specialists"], list)
     ):
         _invalid("preflight.json", evidence)
@@ -966,7 +969,7 @@ def _review_scope_lines(state: RunState, evidence: _Evidence) -> list[str]:
             for name in sorted(evidence.specialist_counts)
         ))
     else:
-        lines.append("- 沒有已提交的唯讀 preflight findings。")
+        lines.append("- 沒有唯讀 preflight findings。")
     if evidence.risk_categories:
         lines.append("- 高風險類別：%s。" % ", ".join(
             _display(evidence, category) for category in evidence.risk_categories
@@ -996,7 +999,7 @@ def _knowledge_candidate(
         ("## 最終 Root Cause", ["- 僅以結構化 finding/resolution identifiers 保留脈絡；請在人工審核時查看證據索引。"]),
         ("## 建立或修正的不變量", _section_bullets(evidence, corrected, "- 沒有可安全引用的不變量修正。", "invariants")),
         ("## 可以提前執行的檢查", ["- 在下一輪前確認結構化 verification 結果與 diff 統計，而非閱讀完整 logs。"]),
-        ("## 下次開工 Checklist", ["- 先確認未解決 finding identifiers、人工 gate 與 verification 摘要。", "- 人工核准後，才由後續流程決定是否寫回 workspace 或 second-brain。"]),
+        ("## 下次開工 Checklist", ["- 先確認未解決 finding identifiers、人工 gate 與 verification 摘要。", "- 人工核准後，才由後續流程決定是否寫回 workspace 的 `second-brain/ai-review/`。"]),
         ("## 證據索引", _evidence_index(evidence)),
     ))
 

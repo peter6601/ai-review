@@ -2,10 +2,8 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "type": "object",
   "additionalProperties": false,
-  "required": ["profile", "patch_digest", "specialists"],
+  "required": ["specialists"],
   "properties": {
-    "profile": {"type": "string", "const": "ios"},
-    "patch_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
     "specialists": {
       "type": "array",
       "minItems": 3,

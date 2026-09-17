@@ -123,6 +123,9 @@ class ReviewWorkflowTestCase(unittest.TestCase):
             doc_max_initial_sources=5,
             doc_max_context_tokens=16000,
             codex_model="gpt-5.6-sol",
+            claude_model="opus[1m]",
+            claude_fallback_model="sonnet",
+            claude_max_budget_usd=5,
         )
         self.brief = "Review the completed retry fix."
         self.run = self.create_run()
@@ -977,10 +980,9 @@ def specialist_finding(name, index=1, *, risk_flags=()):
     }
 
 
-def preflight_submission(patch_digest, *, findings_for=(), risk_flags=()):
+def preflight_envelope(*, findings_for=(), risk_flags=()):
+    """The init-time envelope: specialists only, no profile or patch digest."""
     return {
-        "profile": "ios",
-        "patch_digest": patch_digest,
         "specialists": [
             {
                 "name": name,
@@ -997,30 +999,30 @@ def preflight_submission(patch_digest, *, findings_for=(), risk_flags=()):
 class PreflightSubmissionTests(unittest.TestCase):
     """The submission parser is strict, bounded, and path-safe."""
 
-    digest = "a" * 64
+    def valid_envelope(self, **kwargs):
+        return preflight_envelope(**kwargs)
 
-    def validate(self, payload, **kwargs):
+    def validate(self, payload):
         from ai_review.preflight import validate_preflight
 
-        options = {"patch_digest": self.digest}
-        options.update(kwargs)
-        return validate_preflight(payload, **options)
+        return validate_preflight(payload)
 
     def test_a_complete_clean_submission_is_accepted(self):
-        submission = self.validate(preflight_submission(self.digest))
+        from ai_review.preflight import REQUIRED_SPECIALISTS
 
+        submission = self.validate(self.valid_envelope())
+
+        self.assertEqual(set(submission), {"specialists"})
         self.assertEqual(
-            [item["name"] for item in submission["specialists"]], sorted(SPECIALISTS)
+            [item["name"] for item in submission["specialists"]],
+            list(REQUIRED_SPECIALISTS),
         )
-        self.assertEqual(submission["patch_digest"], self.digest)
 
     def test_findings_normalize_into_the_codex_finding_shape(self):
         from ai_review.preflight import normalized_findings
         from ai_review.runners import validate_codex_review
 
-        submission = self.validate(
-            preflight_submission(self.digest, findings_for=SPECIALISTS)
-        )
+        submission = self.validate(self.valid_envelope(findings_for=SPECIALISTS))
         findings = normalized_findings(submission)
 
         self.assertEqual(len(findings), 3)
@@ -1043,17 +1045,41 @@ class PreflightSubmissionTests(unittest.TestCase):
         from ai_review.preflight import load_preflight_text
 
         with self.assertRaises(ValueError):
-            load_preflight_text(
-                '{"profile":"ios","profile":"ios","patch_digest":"%s","specialists":[]}'
-                % self.digest
-            )
+            load_preflight_text('{"specialists":[],"specialists":[]}')
 
-    def test_a_mismatched_patch_digest_is_rejected(self):
-        with self.assertRaises(ValueError):
-            self.validate(preflight_submission("b" * 64))
+    def test_a_submission_carrying_profile_or_patch_digest_is_rejected(self):
+        from ai_review.preflight import PreflightError, validate_preflight
+
+        for extra, value in (("profile", "ios"), ("patch_digest", "0" * 64)):
+            with self.subTest(extra=extra):
+                payload = self.valid_envelope()
+                payload[extra] = value
+                with self.assertRaises(PreflightError):
+                    validate_preflight(payload)
+
+    def test_a_missing_specialist_is_rejected_not_defaulted(self):
+        from ai_review.preflight import PreflightError, validate_preflight
+
+        payload = self.valid_envelope()
+        payload["specialists"] = payload["specialists"][:2]
+        with self.assertRaises(PreflightError):
+            validate_preflight(payload)
+
+    def test_an_empty_findings_list_is_a_clean_audit(self):
+        from ai_review.preflight import normalized_findings, validate_preflight
+
+        payload = self.valid_envelope()
+        self.assertTrue(
+            all(specialist["findings"] == [] for specialist in payload["specialists"])
+        )
+
+        submission = validate_preflight(payload)
+
+        self.assertEqual(len(submission["specialists"]), 3)
+        self.assertEqual(normalized_findings(submission), ())
 
     def test_missing_extra_or_duplicated_specialists_are_rejected(self):
-        base = preflight_submission(self.digest)
+        base = self.valid_envelope()
         cases = (
             {"specialists": base["specialists"][:2]},
             {"specialists": base["specialists"] + [{"name": "swiftui-reviewer", "findings": []}]},
@@ -1073,7 +1099,7 @@ class PreflightSubmissionTests(unittest.TestCase):
                     self.validate(dict(base, **change))
 
     def test_unknown_keys_and_wrong_enums_are_rejected(self):
-        base = preflight_submission(self.digest, findings_for=("swiftui-reviewer",))
+        base = self.valid_envelope(findings_for=("swiftui-reviewer",))
         cases = (
             lambda value: value.update({"extra": 1}),
             lambda value: value["specialists"][0].update({"extra": 1}),
@@ -1090,7 +1116,7 @@ class PreflightSubmissionTests(unittest.TestCase):
                     self.validate(value)
 
     def test_duplicate_finding_ids_are_rejected_across_specialists(self):
-        base = preflight_submission(self.digest, findings_for=SPECIALISTS)
+        base = self.valid_envelope(findings_for=SPECIALISTS)
         for specialist in base["specialists"]:
             specialist["findings"][0]["id"] = "SAME-001"
 
@@ -1106,7 +1132,7 @@ class PreflightSubmissionTests(unittest.TestCase):
             "",
         ):
             with self.subTest(location=location):
-                base = preflight_submission(self.digest, findings_for=("ux-critique",))
+                base = self.valid_envelope(findings_for=("ux-critique",))
                 base["specialists"][1]["findings"][0]["location"] = location
                 with self.assertRaises(ValueError):
                     self.validate(base)
@@ -1116,7 +1142,7 @@ class PreflightSubmissionTests(unittest.TestCase):
             MAX_PREFLIGHT_STRING_BYTES, MAX_SPECIALIST_FINDINGS,
         )
 
-        crowded = preflight_submission(self.digest)
+        crowded = self.valid_envelope()
         crowded["specialists"][0]["findings"] = [
             specialist_finding("swiftui-reviewer", index)
             for index in range(MAX_SPECIALIST_FINDINGS + 1)
@@ -1124,7 +1150,7 @@ class PreflightSubmissionTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.validate(crowded)
 
-        overlong = preflight_submission(self.digest, findings_for=("swiftui-reviewer",))
+        overlong = self.valid_envelope(findings_for=("swiftui-reviewer",))
         overlong["specialists"][0]["findings"][0]["evidence"] = "é" * (
             MAX_PREFLIGHT_STRING_BYTES
         )
@@ -1133,37 +1159,188 @@ class PreflightSubmissionTests(unittest.TestCase):
 
 
 class IosPreflightWorkflowTests(ReviewWorkflowTestCase):
+    """The specialists are frozen before the run; the loop never stops for them."""
+
     profile = "ios"
 
-    def round_zero_digest(self):
-        return hashlib.sha256(
-            (self.artifacts / "patches" / "round-0000.patch").read_bytes()
-        ).hexdigest()
+    def freeze_preflight(self, **kwargs):
+        """Write exactly what `init review --preflight` leaves behind.
 
-    def submission(self, **kwargs):
-        return preflight_submission(self.round_zero_digest(), **kwargs)
+        Including the manifest digest: the artifacts alone are not the contract,
+        the signed digest over them is.
+        """
+        from ai_review.preflight import (
+            merged_source_ids, normalized_findings, validate_preflight,
+        )
 
-    def test_ios_initial_codex_pass_still_awaits_the_read_only_preflight(self):
-        codex = FakeCodex([review("PASS")])
-        claude = FakeClaude()
+        submission = validate_preflight(preflight_envelope(**kwargs))
+        digest = hashlib.sha256(json.dumps(
+            submission, sort_keys=True, separators=(",", ":"),
+        ).encode("utf-8")).hexdigest()
+        self.run = self.create_run(preflight_digest=digest)
+        self.write_artifact("preflight.json", submission)
+        self.write_artifact("preflight-normalized.json", {
+            "findings": list(normalized_findings(submission)),
+            "source_ids": merged_source_ids(submission),
+        })
+        return submission
+
+    def write_artifact(self, name, contents):
+        path = self.artifacts / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(contents), encoding="utf-8")
+
+    def merged_review(self, sequence=1):
+        return json.loads(
+            (self.artifacts / "merged-reviews" / ("%04d.json" % sequence)).read_text()
+        )
+
+    def test_ios_first_decisive_review_merges_the_frozen_specialist_findings(self):
+        self.freeze_preflight(findings_for=SPECIALISTS)
+        codex = FakeCodex([review("PASS"), review("PASS")])
+        claude = FakeClaude(repairs=[repair_result(
+            "PF-SWIFTUI-SWIFTUI-001", "PF-UX-UX-001", "PF-RESILIENCE-RESILIENCE-001",
+        )])
 
         result = self.workflow(codex=codex, claude=claude, verification=self.green).run(
             self.run.run_id
         )
 
+        # Codex passed, but three specialist findings were already on the table,
+        # so the first decisive review becomes one merged CHANGES_REQUIRED.
+        self.assertEqual(result.status, Status.AWAITING_HUMAN_CODE_REVIEW)
+        self.assertEqual(result.repair_round, 1)
+        decision = self.merged_review()
+        self.assertEqual(decision["verdict"], "CHANGES_REQUIRED")
+        self.assertEqual(sorted(item["id"] for item in decision["findings"]), [
+            "PF-RESILIENCE-RESILIENCE-001", "PF-SWIFTUI-SWIFTUI-001", "PF-UX-UX-001",
+        ])
+
+    def test_a_legacy_run_parked_at_awaiting_preflight_never_resumes(self):
+        """Regression: retiring the command must not unlock the runs it stranded.
+
+        29 stored runs sit at AWAITING_PREFLIGHT.  Removing the pause deleted
+        the early-return with it, so `resume` set them RUNNING again — and the
+        `awaiting_preflight` journal made the pending-review scan skip the very
+        round that had findings, reaching a human gate with zero repairs.
+        """
+        self.freeze_preflight(findings_for=SPECIALISTS)
+        codex = FakeCodex([review("CHANGES_REQUIRED", findings=[blocker("CODE-001")])])
+        workflow = self.workflow(codex=codex, claude=FakeClaude(), verification=self.green)
+        # Recreate exactly what a stranded run looks like on disk.
+        self.write_artifact("code-review-actions/0001.json", {
+            "action": "awaiting_preflight", "review_sequence": 1,
+            "patch_digest": "a" * 64,
+        })
+        state_path = self.artifacts / "state.json"
+        persisted = json.loads(state_path.read_text())
+        persisted["status"] = "AWAITING_PREFLIGHT"
+        state_path.write_text(json.dumps(persisted), encoding="utf-8")
+
+        result = workflow.run(self.run.run_id)
+
         self.assertEqual(result.status, Status.AWAITING_PREFLIGHT)
-        self.assertEqual(codex.call_count, 1)
-        self.assertEqual(claude.call_count, 0)
+        self.assertEqual(codex.call_count, 0)
+
+    def test_the_signed_preflight_is_the_source_of_the_merged_findings(self):
+        """Regression: the approved digest bound nothing that was actually used.
+
+        `preflight_digest` was written into the manifest and never read back, so
+        emptying the derived artifact after approval dropped every specialist
+        finding the human had signed for.
+        """
+        self.freeze_preflight(findings_for=SPECIALISTS)
+        # Post-approval tampering with the derived artifact only.
+        self.write_artifact("preflight-normalized.json", {"findings": [], "source_ids": {}})
+        codex = FakeCodex([review("PASS"), review("PASS")])
+        claude = FakeClaude(repairs=[repair_result(
+            "PF-SWIFTUI-SWIFTUI-001", "PF-UX-UX-001", "PF-RESILIENCE-RESILIENCE-001",
+        )])
+
+        result = self.workflow(codex=codex, claude=claude, verification=self.green).run(
+            self.run.run_id
+        )
+
+        self.assertEqual(result.status, Status.AWAITING_HUMAN_CODE_REVIEW)
+        self.assertEqual(sorted(item["id"] for item in self.merged_review()["findings"]), [
+            "PF-RESILIENCE-RESILIENCE-001", "PF-SWIFTUI-SWIFTUI-001", "PF-UX-UX-001",
+        ])
+
+    def test_a_missing_or_altered_signed_preflight_fails_closed(self):
+        for corrupt in ("delete", "alter"):
+            with self.subTest(corrupt=corrupt):
+                self.setUp()
+                self.freeze_preflight(findings_for=SPECIALISTS)
+                if corrupt == "delete":
+                    (self.artifacts / "preflight.json").unlink()
+                else:
+                    self.write_artifact("preflight.json", preflight_envelope())
+                codex = FakeCodex([review("PASS")])
+                claude = FakeClaude()
+
+                result = self.workflow(
+                    codex=codex, claude=claude, verification=self.green,
+                ).run(self.run.run_id)
+
+                self.assertEqual(result.status, Status.PAUSED)
+                self.assertEqual(claude.call_count, 0)
+
+    def test_losing_the_derived_artifact_changes_nothing(self):
+        """It is a cache, not the contract: the signed source is re-read."""
+        self.freeze_preflight(findings_for=SPECIALISTS)
+        (self.artifacts / "preflight-normalized.json").unlink()
+        codex = FakeCodex([review("PASS"), review("PASS")])
+        claude = FakeClaude(repairs=[repair_result(
+            "PF-SWIFTUI-SWIFTUI-001", "PF-UX-UX-001", "PF-RESILIENCE-RESILIENCE-001",
+        )])
+
+        result = self.workflow(codex=codex, claude=claude, verification=self.green).run(
+            self.run.run_id
+        )
+
+        self.assertEqual(result.status, Status.AWAITING_HUMAN_CODE_REVIEW)
+        self.assertEqual(len(self.merged_review()["findings"]), 3)
+
+    def test_a_run_never_enters_awaiting_preflight(self):
+        self.freeze_preflight(findings_for=SPECIALISTS)
+        codex = FakeCodex([
+            review("CHANGES_REQUIRED", findings=[blocker("CODE-001")]), review("PASS"),
+        ])
+        claude = FakeClaude(repairs=[repair_result(
+            "CODE-001", "PF-SWIFTUI-SWIFTUI-001", "PF-UX-UX-001",
+            "PF-RESILIENCE-RESILIENCE-001",
+        )])
+
+        result = self.workflow(codex=codex, claude=claude, verification=self.green).run(
+            self.run.run_id
+        )
+
+        self.assertEqual(result.status, Status.AWAITING_HUMAN_CODE_REVIEW)
+        self.assertFalse((self.artifacts / "preflight-request.json").exists())
         action = json.loads(
             (self.artifacts / "code-review-actions" / "0001.json").read_text()
         )
-        self.assertEqual(action["action"], "awaiting_preflight")
-        request = json.loads((self.artifacts / "preflight-request.json").read_text())
-        self.assertEqual(request["patch_digest"], self.round_zero_digest())
-        self.assertEqual(sorted(request["specialists"]), sorted(SPECIALISTS))
-        self.assertIs(request["read_only"], True)
+        self.assertNotEqual(action.get("action"), "awaiting_preflight")
 
-    def test_generic_profile_never_enters_preflight(self):
+    def test_codex_round_one_does_not_see_specialist_findings(self):
+        self.freeze_preflight(findings_for=SPECIALISTS)
+        codex = FakeCodex([review("PASS"), review("PASS")])
+        claude = FakeClaude(repairs=[repair_result(
+            "PF-SWIFTUI-SWIFTUI-001", "PF-UX-UX-001", "PF-RESILIENCE-RESILIENCE-001",
+        )])
+
+        self.workflow(codex=codex, claude=claude, verification=self.green).run(
+            self.run.run_id
+        )
+
+        # Codex reviews the code on its own terms; the specialists only ever
+        # reach the repair.
+        first = json.dumps(codex.calls[0])
+        self.assertNotIn("PF-", first)
+        self.assertNotIn("preflight", first.lower())
+        self.assertNotIn("specialist", first.lower())
+
+    def test_generic_profile_never_merges_specialist_findings(self):
         generic = GenericDirectReviewTests("test_initial_pass_reaches_human_code_review_without_calling_claude")
         generic.setUp()
         try:
@@ -1172,51 +1349,36 @@ class IosPreflightWorkflowTests(ReviewWorkflowTestCase):
                 verification=generic.green,
             ).run(generic.run.run_id)
             self.assertEqual(result.status, Status.AWAITING_HUMAN_CODE_REVIEW)
-            self.assertFalse((generic.artifacts / "preflight-request.json").exists())
+            self.assertFalse((generic.artifacts / "merged-reviews").exists())
         finally:
             generic.tearDown()
 
-    def test_initial_codex_findings_persist_while_awaiting_specialists(self):
-        codex = FakeCodex([review("CHANGES_REQUIRED", findings=[blocker("CODE-001")])])
+    def test_all_clean_codex_and_specialists_reach_human_review_without_claude(self):
+        self.freeze_preflight()
+        codex = FakeCodex([review("PASS")])
         claude = FakeClaude()
 
         result = self.workflow(codex=codex, claude=claude, verification=self.green).run(
             self.run.run_id
         )
 
-        self.assertEqual(result.status, Status.AWAITING_PREFLIGHT)
-        self.assertEqual(result.repair_round, 0)
-        self.assertEqual(claude.call_count, 0)
-        persisted = json.loads((self.artifacts / "reviews" / "0001.json").read_text())
-        self.assertEqual([item["id"] for item in persisted["findings"]], ["CODE-001"])
-
-    def test_all_clean_codex_and_specialists_reach_human_review_without_claude(self):
-        codex = FakeCodex([review("PASS")])
-        claude = FakeClaude()
-        workflow = self.workflow(codex=codex, claude=claude, verification=self.green)
-        self.assertEqual(
-            workflow.run(self.run.run_id).status, Status.AWAITING_PREFLIGHT
-        )
-
-        result = workflow.submit_preflight(self.run.run_id, self.submission())
-
         self.assertEqual(result.status, Status.AWAITING_HUMAN_CODE_REVIEW)
         self.assertEqual(result.repair_round, 0)
         self.assertEqual(claude.call_count, 0)
         self.assertEqual(codex.call_count, 1)
+        self.assertEqual(self.merged_review()["verdict"], "PASS")
 
     def test_combined_findings_produce_exactly_one_unified_claude_repair(self):
+        self.freeze_preflight(findings_for=SPECIALISTS)
         codex = FakeCodex([
             review("CHANGES_REQUIRED", findings=[blocker("CODE-001")]), review("PASS"),
         ])
         claude = FakeClaude(repairs=[repair_result(
             "CODE-001", "PF-SWIFTUI-SWIFTUI-001", "PF-UX-UX-001", "PF-RESILIENCE-RESILIENCE-001",
         )])
-        workflow = self.workflow(codex=codex, claude=claude, verification=self.green)
-        workflow.run(self.run.run_id)
 
-        result = workflow.submit_preflight(
-            self.run.run_id, self.submission(findings_for=SPECIALISTS)
+        result = self.workflow(codex=codex, claude=claude, verification=self.green).run(
+            self.run.run_id
         )
 
         self.assertEqual(result.status, Status.AWAITING_HUMAN_CODE_REVIEW)
@@ -1233,6 +1395,7 @@ class IosPreflightWorkflowTests(ReviewWorkflowTestCase):
         self.assertEqual(codex.call_count, 2)
 
     def test_specialists_do_not_rerun_after_the_unified_repair(self):
+        self.freeze_preflight(findings_for=("swiftui-reviewer",))
         codex = FakeCodex([
             review("CHANGES_REQUIRED", findings=[blocker("CODE-001")]),
             review("CHANGES_REQUIRED", findings=[
@@ -1244,55 +1407,69 @@ class IosPreflightWorkflowTests(ReviewWorkflowTestCase):
             repair_result("CODE-001", "PF-SWIFTUI-SWIFTUI-001"),
             repair_result("CODE-002"),
         ])
-        workflow = self.workflow(codex=codex, claude=claude, verification=self.green)
-        workflow.run(self.run.run_id)
 
-        result = workflow.submit_preflight(
-            self.run.run_id, self.submission(findings_for=("swiftui-reviewer",))
+        result = self.workflow(codex=codex, claude=claude, verification=self.green).run(
+            self.run.run_id
         )
 
         self.assertEqual(result.status, Status.AWAITING_HUMAN_CODE_REVIEW)
         self.assertEqual(result.repair_round, 2)
         self.assertEqual(len(claude.repair_calls), 2)
-        self.assertNotIn("repair_lenses", str(claude.repair_calls[1]["finding_ids"]))
         self.assertEqual(claude.repair_calls[1]["finding_ids"], ["CODE-002"])
+        # The specialists were merged once, into the first decisive review only.
         self.assertEqual(
-            len(list((self.artifacts).glob("preflight.json"))), 1
+            [path.name for path in sorted((self.artifacts / "merged-reviews").iterdir())],
+            ["0001.json"],
         )
 
-    def test_only_one_preflight_submission_is_ever_accepted(self):
-        workflow = self.workflow(
-            codex=FakeCodex([review("PASS")]), claude=FakeClaude(),
-            verification=self.green,
-        )
-        workflow.run(self.run.run_id)
-        digest = self.round_zero_digest()
-        workflow.submit_preflight(self.run.run_id, self.submission())
+    def test_a_replayed_round_reuses_the_merged_decision_not_the_raw_review(self):
+        """A killed repair must not be replayed against the raw Codex review.
 
-        with self.assertRaises(Exception):
-            workflow.submit_preflight(
-                self.run.run_id, preflight_submission(digest, findings_for=SPECIALISTS)
-            )
+        `_pending_code_review` replays a round whose repair never advanced the
+        counter, and it replays the *raw* persisted Codex review.  The
+        specialist findings exist only in the merged decision, so replaying the
+        raw one would silently drop them from the repair queue.
+        """
+        self.freeze_preflight(findings_for=SPECIALISTS)
 
-        state = self.store.load(self.run.run_id)
-        self.assertEqual(state.status, Status.AWAITING_HUMAN_CODE_REVIEW)
-        self.assertEqual(state.repair_round, 0)
+        def die(*_args, **_kwargs):
+            raise RuntimeError("the repair process was killed")
 
-    def test_a_submission_outside_awaiting_preflight_fails_closed(self):
-        workflow = self.workflow(
-            codex=FakeCodex([review("PASS")]), claude=FakeClaude(),
-            verification=self.green,
-        )
+        killed = FakeClaude(repairs=[])
+        killed.repair = die
+        self.workflow(
+            codex=FakeCodex([review("CHANGES_REQUIRED", findings=[blocker("CODE-001")])]),
+            claude=killed, verification=self.green,
+        ).run(self.run.run_id)
 
-        with self.assertRaises(Exception):
-            workflow.submit_preflight(self.run.run_id, self.submission())
+        # The merge landed; the repair did not.
+        self.assertTrue((self.artifacts / "merged-reviews" / "0001.json").exists())
+        # Put the run in the one window the intent journal does not cover: the
+        # kill landed after the merge and before the repair was journalled.
+        for intent in (self.artifacts / "claude-intents").glob("*.json"):
+            intent.unlink()
+        state_path = self.artifacts / "state.json"
+        persisted = json.loads(state_path.read_text())
+        self.assertEqual(persisted["repair_round"], 0)
+        persisted["status"] = "RUNNING"
+        persisted.pop("pause_reason", None)
+        state_path.write_text(json.dumps(persisted), encoding="utf-8")
 
-        self.assertEqual(
-            self.store.load(self.run.run_id).status, Status.READY
-        )
-        self.assertFalse((self.artifacts / "preflight.json").exists())
+        resumed = FakeClaude(repairs=[repair_result(
+            "CODE-001", "PF-SWIFTUI-SWIFTUI-001", "PF-UX-UX-001",
+            "PF-RESILIENCE-RESILIENCE-001",
+        )])
+        self.workflow(
+            codex=FakeCodex([review("PASS")]), claude=resumed, verification=self.green,
+        ).run(self.run.run_id)
+
+        self.assertEqual(sorted(resumed.repair_calls[0]["finding_ids"]), [
+            "CODE-001", "PF-RESILIENCE-RESILIENCE-001",
+            "PF-SWIFTUI-SWIFTUI-001", "PF-UX-UX-001",
+        ])
 
     def test_specialist_risk_flags_reach_the_deterministic_risk_detector(self):
+        self.freeze_preflight(findings_for=("ux-critique",), risk_flags=("public_api",))
         repo = self.repo
 
         def touch_lockfile(_round):
@@ -1302,12 +1479,9 @@ class IosPreflightWorkflowTests(ReviewWorkflowTestCase):
         claude = FakeClaude(
             repairs=[repair_result("CODE-001", "PF-UX-UX-001")], on_repair=touch_lockfile,
         )
-        workflow = self.workflow(codex=codex, claude=claude, verification=self.green)
-        workflow.run(self.run.run_id)
 
-        result = workflow.submit_preflight(
-            self.run.run_id,
-            self.submission(findings_for=("ux-critique",), risk_flags=("public_api",)),
+        result = self.workflow(codex=codex, claude=claude, verification=self.green).run(
+            self.run.run_id
         )
 
         self.assertEqual(result.status, Status.PAUSED)
@@ -1607,33 +1781,9 @@ class ReviewScopeIntegrityTests(ReviewWorkflowTestCase):
 class IosPreflightIntegrityTests(ReviewWorkflowTestCase):
     profile = "ios"
 
-    def test_a_worktree_edit_during_preflight_is_refused(self):
-        codex = FakeCodex([review("PASS")])
-        claude = FakeClaude()
-        workflow = self.workflow(codex=codex, claude=claude, verification=self.green)
-        self.assertEqual(
-            workflow.run(self.run.run_id).status, Status.AWAITING_PREFLIGHT
-        )
-        digest = hashlib.sha256(
-            (self.artifacts / "patches" / "round-0000.patch").read_bytes()
-        ).hexdigest()
-        # A file added while the specialists ran was never seen by Codex.
-        (self.repo / "Added.swift").write_text("struct Added {}\n", encoding="utf-8")
-
-        with self.assertRaises(Exception):
-            workflow.submit_preflight(
-                self.run.run_id, preflight_submission(digest)
-            )
-
-        state = self.store.load(self.run.run_id)
-        self.assertNotEqual(state.status, Status.AWAITING_HUMAN_CODE_REVIEW)
-        self.assertEqual(claude.call_count, 0)
-        self.assertFalse((self.artifacts / "preflight.json").exists())
-
     def test_two_lenses_reporting_one_defect_merge_and_keep_every_source_id(self):
         from ai_review.preflight import merged_source_ids, normalized_findings, validate_preflight
 
-        digest = "a" * 64
         shared = {
             "severity": "minor", "category": "swiftui",
             "location": "Sources/Feature.swift:42",
@@ -1641,7 +1791,6 @@ class IosPreflightIntegrityTests(ReviewWorkflowTestCase):
             "risk_flags": [],
         }
         submission = validate_preflight({
-            "profile": "ios", "patch_digest": digest,
             "specialists": [
                 {"name": "swiftui-reviewer", "findings": [
                     dict(shared, id="SWIFTUI-001"),
@@ -1651,7 +1800,7 @@ class IosPreflightIntegrityTests(ReviewWorkflowTestCase):
                 {"name": "ux-critique", "findings": []},
                 {"name": "resilience-auditor", "findings": []},
             ],
-        }, patch_digest=digest)
+        })
 
         findings = normalized_findings(submission)
         mapping = merged_source_ids(submission)
@@ -1674,10 +1823,7 @@ class IosPreflightIntegrityTests(ReviewWorkflowTestCase):
     def test_distinct_lenses_on_the_same_line_stay_separate_findings(self):
         from ai_review.preflight import normalized_findings, validate_preflight
 
-        digest = "a" * 64
-        submission = validate_preflight(
-            preflight_submission(digest, findings_for=SPECIALISTS), patch_digest=digest,
-        )
+        submission = validate_preflight(preflight_envelope(findings_for=SPECIALISTS))
 
         findings = normalized_findings(submission)
 
@@ -1711,7 +1857,7 @@ class ReviewRunnerRoutingTests(ReviewWorkflowTestCase):
         from ai_review.runners import RunnerError, build_claude_argv
 
         identity = resolve_executable(sys.executable)
-        claude = _LocalClaude(self.repo, mode="review", identity=identity)
+        claude = _LocalClaude(self.repo, mode="review", identity=identity, model="opus[1m]", fallback_model="sonnet", max_budget_usd=5)
         calls = []
         claude._call = lambda schema, prompt, inputs: calls.append((schema, prompt))
 
@@ -1724,7 +1870,7 @@ class ReviewRunnerRoutingTests(ReviewWorkflowTestCase):
         ])
         with self.assertRaises(RunnerError):
             claude.implement({"findings": []})
-        argv = build_claude_argv("{}", "fix", mode="review")
+        argv = build_claude_argv("{}", "fix", mode="review", model="opus[1m]", fallback_model="sonnet", max_budget_usd=5)
         self.assertIn("--safe-mode", argv)
         self.assertNotIn("Bash", argv[argv.index("--tools") + 1])
         self.assertEqual(argv[argv.index("--permission-mode") + 1], "acceptEdits")

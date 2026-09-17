@@ -10,6 +10,7 @@ import hmac
 import json
 import math
 import os
+import subprocess
 import tempfile
 import time
 from dataclasses import replace
@@ -91,11 +92,14 @@ class PlanWorkflow:
     # Statuses that mean the loop has already stopped at a gate.  A subclass
     # whose run ends somewhere else adds that status here rather than copying
     # ``run``.
+    # INTERRUPTED is deliberately absent: an interrupted run is one whose
+    # external call failed for a reason outside the work, and re-entering it is
+    # the whole point of the status.  The loop still stops on any status that is
+    # not RUNNING.
     _HALT_STATUSES = (
         Status.AWAITING_HUMAN_PLAN_REVIEW,
         Status.AWAITING_USER_INPUT,
         Status.PAUSED,
-        Status.INTERRUPTED,
     )
 
     # How many replacement candidates a human may offer for one expansion.
@@ -153,7 +157,7 @@ class PlanWorkflow:
                 self._handle_review(state, artifacts, sequence, review)
             return state
         except RunnerInterrupted as error:
-            self._pause_loaded(state, "RUNNER_INTERRUPTED", str(error))
+            self._interrupt_loaded(state, "RUNNER_INTERRUPTED", str(error))
             raise
         except Exception as error:
             # A malformed model result, invalid state, or runner failure must never
@@ -254,7 +258,7 @@ class PlanWorkflow:
             # state; the caller can retry only the original immutable answers.
             raise
         except RunnerInterrupted as error:
-            self._pause_loaded(state, "RUNNER_INTERRUPTED", str(error))
+            self._interrupt_loaded(state, "RUNNER_INTERRUPTED", str(error))
             raise
         except Exception as error:
             return self._pause_loaded(state, "INVALID_USER_ANSWER_OR_PLAN_UPDATE", str(error))
@@ -952,6 +956,24 @@ class PlanWorkflow:
     def _artifacts(self, state: RunState) -> Path:
         return self.store._run_directory(state)
 
+    def _interrupt_loaded(self, state: RunState, reason: str, detail: str) -> RunState:
+        """Record a resumable interruption instead of voiding the run.
+
+        A paused run is terminal by design.  An interruption says only that an
+        external call did not land, so every completed round stays valid and
+        ``resume`` re-enters the loop where it stopped.
+        """
+        try:
+            artifacts = self._artifacts(state)
+            self._write_json(
+                artifacts / "interruption.json", {"reason": reason, "detail": detail}
+            )
+            self._set_status(state, Status.INTERRUPTED)
+            self.store.save(state)
+        except BaseException:
+            self._set_status(state, Status.INTERRUPTED)
+        return state
+
     def _pause_loaded(self, state: RunState, reason: str, detail: str) -> RunState:
         try:
             artifacts = self._artifacts(state)
@@ -1095,7 +1117,7 @@ class CodeWorkflow(PlanWorkflow):
         except AnswerConflict:
             raise
         except RunnerInterrupted as error:
-            self._pause_loaded(state, "RUNNER_INTERRUPTED", str(error))
+            self._interrupt_loaded(state, "RUNNER_INTERRUPTED", str(error))
             raise
         except Exception as error:
             return self._pause_loaded(state, "INVALID_CODE_USER_ANSWER", str(error))
@@ -1104,7 +1126,10 @@ class CodeWorkflow(PlanWorkflow):
         state = self.store.load(run_id)
         try:
             self._validate_state(state)
-            if state.status in (Status.AWAITING_HUMAN_CODE_REVIEW, Status.AWAITING_USER_INPUT, Status.PAUSED, Status.INTERRUPTED):
+            # Reuse the shared tuple rather than a copy of it: this inline list
+            # is exactly the duplicate that kept INTERRUPTED unresumable here
+            # after the base class had already opened it.
+            if state.status in self._HALT_STATUSES + (Status.AWAITING_HUMAN_CODE_REVIEW,):
                 return state
             self._set_running(state)
             self.store.save(state)
@@ -1114,15 +1139,27 @@ class CodeWorkflow(PlanWorkflow):
             while state.status == Status.RUNNING:
                 sequence, review = self._pending_code_review(state, artifacts)
                 if review is None:
-                    verification = self._run_verification(state, artifacts, self._next_sequence(artifacts / "verification-rounds"))
+                    # The review sequence decides the round, and the verification
+                    # is taken under that same number.  Letting the two counters
+                    # advance independently meant a resumed round ran a fresh
+                    # verification as 0002 while retrying review 0001: judged
+                    # against one snapshot, recorded against another.
+                    # `_run_verification` returns an existing round untouched, so
+                    # this also stops a resume from re-running the commands.
+                    sequence = self._next_sequence(artifacts / "reviews")
+                    verification = self._run_verification(state, artifacts, sequence)
                     if state.status != Status.RUNNING:
                         break
-                    sequence = self._next_sequence(artifacts / "reviews")
                     inputs = self._review_input(state, artifacts, verification)
                     intent = artifacts / "codex-intents" / ("%04d.json" % sequence)
                     if self.store.artifact_exists(intent):
-                        raise AmbiguousExternalCall("Codex review intent has no raw result")
-                    self._write_json(intent, {"kind": "review", "inputs": inputs})
+                        if not self._intent_is_replayable(state, intent):
+                            raise AmbiguousExternalCall("Codex review intent has no raw result")
+                        self.store.remove_artifact(intent)
+                    self._write_json(intent, {
+                        "kind": "review", "inputs": inputs,
+                        "patch_digest": self._worktree_digest(state),
+                    })
                     self._validate_state(state)
                     review = self.codex.review(inputs)
                     self._write_json(artifacts / "reviews" / ("%04d.json" % sequence), review)
@@ -1131,7 +1168,7 @@ class CodeWorkflow(PlanWorkflow):
         except AmbiguousExternalCall as error:
             return self._pause_loaded(state, "AMBIGUOUS_EXTERNAL_CALL", str(error))
         except RunnerInterrupted as error:
-            self._pause_loaded(state, "RUNNER_INTERRUPTED", str(error))
+            self._interrupt_loaded(state, "RUNNER_INTERRUPTED", str(error))
             raise
         except Exception as error:
             return self._pause_loaded(state, "WORKFLOW_ERROR", str(error))
@@ -1254,8 +1291,13 @@ class CodeWorkflow(PlanWorkflow):
             raw = self._read_json(output)
         else:
             if self.store.artifact_exists(intent):
-                raise AmbiguousExternalCall("Claude repair intent has no raw result")
-            self._write_json(intent, {"kind": "repair", "inputs": inputs})
+                if not self._intent_is_replayable(state, intent):
+                    raise AmbiguousExternalCall("Claude repair intent has no raw result")
+                self.store.remove_artifact(intent)
+            self._write_json(intent, {
+                "kind": "repair", "inputs": inputs,
+                "patch_digest": self._worktree_digest(state),
+            })
             self._validate_state(state)
             raw = self.claude.repair(inputs)
             self._validate_state(state)
@@ -1309,6 +1351,44 @@ class CodeWorkflow(PlanWorkflow):
             self._capture_patch(state, artifacts, state.repair_round)
         elif state.repair_round < before:
             raise WorkflowError("code repair action journal is ahead of persisted state")
+
+    def _worktree_digest(self, state: RunState) -> str:
+        """Digest the worktree exactly as a captured round patch would be."""
+        patch, _production = capture_diff_bytes(
+            Path(state.manifest.repo_path), state.manifest.base_oid,
+            production_excludes=self.policy.production_excludes,
+        )
+        return hashlib.sha256(patch).hexdigest()
+
+    # Only calls that cannot write are replayable.  The digest below is built
+    # from `capture_diff_bytes`, which lists untracked files with
+    # `--exclude-standard` and therefore cannot see a gitignored path -- and
+    # nothing stops the repair Claude from writing one.  So a matching digest
+    # proves nothing about a mutating call, and only a read-only kind qualifies.
+    _REPLAYABLE_KINDS = frozenset({"review"})
+
+    def _intent_is_replayable(self, state: RunState, intent: Path) -> bool:
+        """True when the recorded intent provably left the worktree untouched.
+
+        An intent with no result means an external call did not land.  For a
+        mutating call that is unanswerable -- it may have written a file the
+        patch cannot see -- so it stays ambiguous and fails closed, exactly as
+        before.  A read-only call writes nothing by construction, and the
+        recorded digest additionally proves that nothing else moved underneath
+        it, so it can be asked again.
+        """
+        record = self._read_json(intent, default=None)
+        if not isinstance(record, dict):
+            return False
+        if record.get("kind") not in self._REPLAYABLE_KINDS:
+            return False
+        recorded = record.get("patch_digest")
+        if not isinstance(recorded, str) or not recorded:
+            return False
+        try:
+            return recorded == self._worktree_digest(state)
+        except (OSError, ValueError, subprocess.SubprocessError):
+            return False
 
     def _capture_patch(self, state: RunState, artifacts: Path, round_number: int) -> None:
         patch_path = artifacts / "patches" / ("round-%04d.patch" % round_number)

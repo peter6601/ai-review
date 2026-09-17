@@ -447,10 +447,8 @@ def review_repair(
     }
 
 
-def specialist_submission(patch_digest):
+def specialist_submission():
     return {
-        "profile": "ios",
-        "patch_digest": patch_digest,
         "specialists": [
             {
                 "name": name,
@@ -508,12 +506,18 @@ class DirectReviewEndToEndTests(_ExternalHarness, unittest.TestCase):
         self.temp.cleanup()
 
     def init_review(self, profile="generic"):
+        arguments = []
+        if profile == "ios":
+            findings = self.root / "preflight.json"
+            findings.write_text(json.dumps(specialist_submission()), encoding="utf-8")
+            arguments = ["--preflight", str(findings)]
         return self.cli(
             "init", "review", "--repo", str(self.repo), "--base", "HEAD",
             "--brief", "Review the completed local change", "--profile", profile,
             "--verify", json.dumps({
                 "kind": "test", "argv": self.test_argv, "scope": "task_specific_test",
             }),
+            *arguments,
         )
 
     def approved_review(self, profile="generic"):
@@ -624,22 +628,17 @@ class DirectReviewEndToEndTests(_ExternalHarness, unittest.TestCase):
         initialized = self.approved_review("ios")
         run_id = initialized["run_id"]
 
-        gated = self.cli("run", run_id)
+        # The specialists were frozen at init, so the whole loop is one call.
+        result = self.cli("run", run_id)
 
-        self.assertEqual(gated["status"], "AWAITING_PREFLIGHT")
-        self.assertEqual(gated["next_action"], "submit_preflight")
-        self.assertEqual([call["tool"] for call in self.external_calls()], ["codex"])
-        request = json.loads(
-            (self.artifacts(run_id) / "preflight-request.json").read_text()
+        self.assertFalse((self.artifacts(run_id) / "preflight-request.json").exists())
+        merged = json.loads(
+            (self.artifacts(run_id) / "merged-reviews" / "0001.json").read_text()
         )
-        self.assertIs(request["read_only"], True)
-        findings_path = self.root / "preflight.json"
-        findings_path.write_text(
-            json.dumps(specialist_submission(request["patch_digest"])), encoding="utf-8"
+        self.assertEqual(
+            sorted(item["id"] for item in merged["findings"]),
+            ["CODE-001", *specialist_ids],
         )
-
-        result = self.cli("submit-preflight", run_id, "--findings", str(findings_path))
-
         self.assertEqual(result["status"], "AWAITING_HUMAN_CODE_REVIEW")
         self.assertEqual(result["repair_round"], 1)
         calls = self.external_calls()

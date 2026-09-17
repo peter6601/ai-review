@@ -25,6 +25,73 @@ from ai_review.runners import (
 from ai_review.git_diff import GitDiffError, _resolve_base_ref, capture_diff
 
 
+
+class ClaudeRepairBoundsTests(unittest.TestCase):
+    """The repair call carries its own model and its own ceiling."""
+
+    def argv(self, **changes):
+        from ai_review.runners import build_claude_argv
+
+        # Deliberately not the shipped defaults: a regression to a literal
+        # `opus[1m]`/`sonnet`/`5` would pass every assertion below otherwise.
+        values = {
+            "model": "haiku",
+            "fallback_model": "opus",
+            "max_budget_usd": 17,
+        }
+        return build_claude_argv("{}", "fix", mode="review", **dict(values, **changes))
+
+    def test_the_repair_states_its_model_fallback_and_budget(self):
+        argv = self.argv()
+
+        self.assertEqual(argv[argv.index("--model") + 1], "haiku")
+        self.assertEqual(argv[argv.index("--fallback-model") + 1], "opus")
+        self.assertEqual(argv[argv.index("--max-budget-usd") + 1], "17")
+        # Still one argv item per value, and still no shell anywhere.
+        self.assertTrue(all(isinstance(item, str) and item for item in argv))
+
+    def test_the_bounds_are_required_and_never_defaulted(self):
+        from ai_review.runners import build_claude_argv
+
+        with self.assertRaises(TypeError):
+            build_claude_argv("{}", "fix", mode="review")
+        for changes in (
+            {"model": ""}, {"fallback_model": ""}, {"max_budget_usd": 0},
+            {"max_budget_usd": -1}, {"max_budget_usd": "5"},
+        ):
+            with self.subTest(changes=changes):
+                with self.assertRaises(ValueError):
+                    self.argv(**changes)
+
+    def test_the_policy_values_reach_the_argv_through_the_runner(self):
+        """Cover policy -> _LocalClaude -> argv, not just the builder in isolation."""
+        from unittest.mock import patch
+
+        from ai_review.cli import _LocalClaude
+
+        claude = _LocalClaude(
+            Path("."), mode="review", model="haiku", fallback_model="opus",
+            max_budget_usd=17, identity={"path": "/bin/echo", "digest": "0" * 64,
+                                         "inode": 1, "size": 1},
+        )
+        with patch("ai_review.cli._run_external", return_value="{}") as external, patch(
+            "ai_review.cli.validate_executable_identity", return_value="claude",
+        ):
+            claude.repair({"finding_ids": []})
+
+        argv = external.call_args.args[0]
+        self.assertEqual(argv[argv.index("--model") + 1], "haiku")
+        self.assertEqual(argv[argv.index("--fallback-model") + 1], "opus")
+        self.assertEqual(argv[argv.index("--max-budget-usd") + 1], "17")
+
+    def test_the_safe_mode_boundary_is_unchanged(self):
+        argv = self.argv()
+
+        self.assertIn("--safe-mode", argv)
+        self.assertNotIn("Bash", argv[argv.index("--tools") + 1])
+        self.assertNotIn("--dangerously-skip-permissions", argv)
+
+
 class RunnerTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -119,7 +186,7 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(scoped_help.returncode, 0, scoped_help.stderr)
 
     def test_claude_argv_disallows_remote_mutations_without_permission_bypass(self):
-        argv = build_claude_argv('{"type":"object"}', "implement $()")
+        argv = build_claude_argv('{"type":"object"}', "implement $()", model="opus[1m]", fallback_model="sonnet", max_budget_usd=5)
 
         self.assertIn("--safe-mode", argv)
         self.assertNotIn("Bash", argv[argv.index("--tools") + 1])
@@ -168,14 +235,14 @@ class RunnerTests(unittest.TestCase):
             self.assertNotIn(forbidden, called)
 
     def test_review_mode_claude_argv_keeps_the_bash_free_boundary(self):
-        argv = build_claude_argv('{"type":"object"}', "fix findings", mode="review")
+        argv = build_claude_argv('{"type":"object"}', "fix findings", mode="review", model="opus[1m]", fallback_model="sonnet", max_budget_usd=5)
 
         self.assertNotIn("--dangerously-skip-permissions", argv)
         self.assertIn("--safe-mode", argv)
         self.assertEqual(argv[argv.index("--tools") + 1], "Read,Glob,Grep,Edit,Write")
         self.assertEqual(argv[argv.index("--permission-mode") + 1], "acceptEdits")
         with self.assertRaises(ValueError):
-            build_claude_argv('{"type":"object"}', "fix", mode="specialists")
+            build_claude_argv('{"type":"object"}', "fix", mode="specialists", model="opus[1m]", fallback_model="sonnet", max_budget_usd=5)
 
     def test_timeout_is_reported_as_runner_interruption(self):
         with patch("ai_review.runners.platform.system", return_value="Linux"):
@@ -236,15 +303,13 @@ class RunnerTests(unittest.TestCase):
         execution = calls[-1]
         self.assertEqual(execution[0], "/usr/bin/sandbox-exec")
         profile = execution[execution.index("-p") + 1]
-        # Both directions of IP networking must be denied.
+        # IP 網路的兩個方向都必須拒絕。
         self.assertIn('(deny network-outbound (remote ip "*:*"))', profile)
         self.assertIn('(deny network-inbound (local ip "*:*"))', profile)
-        # 🔴 MUST NOT use `(deny network*)` — it blocks unix domain sockets
-        # too, and on macOS the simulator's XCTest must talk to testmanagerd
-        # over a unix socket. With it, the build succeeds but tests never
-        # execute (exit 65), leaving the iOS profile's verification unusable.
-        # This assertion is the regression guard for that bug, not a style
-        # preference.
+        # 🔴 **不得**使用 `(deny network*)`——它連 unix domain socket 一起擋，
+        # 而 macOS 上模擬器的 XCTest 必須經 unix socket 與 testmanagerd 通訊。
+        # 用它的話 build 會成功但測試從未執行（exit 65），iOS profile 的 verification
+        # 形同無法使用。這條斷言是那個 bug 的迴歸護欄，不是風格偏好。
         self.assertNotIn("(deny network*)", profile)
         self.assertIn("(deny file-write*", profile)
         self.assertIn(".git", profile)

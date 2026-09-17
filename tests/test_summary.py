@@ -418,13 +418,7 @@ class ReviewSummaryTests(unittest.TestCase):
             "introduced_evidence": [dependency_evidence],
             "path_fingerprints": {"Package.resolved": "b" * 64},
         })
-        self.write_json("preflight.json", {
-            "profile": "ios", "patch_digest": "a" * 64,
-            "specialists": [
-                {"name": name, "findings": []}
-                for name in ("resilience-auditor", "swiftui-reviewer", "ux-critique")
-            ],
-        })
+        self.write_preflight_as_init_does()
 
         with unittest.mock.patch.object(
             type(self.run), "plan_path", new_callable=unittest.mock.PropertyMock
@@ -441,6 +435,62 @@ class ReviewSummaryTests(unittest.TestCase):
         self.assertIn("修復輪數：2", text)
         self.assertIn("Verification", text)
         self.assertNotIn("# Plan", text)
+
+    def write_preflight_as_init_does(self, *, findings_for=()):
+        """Write the artifact `init review --preflight` actually produces."""
+        from ai_review.preflight import validate_preflight
+
+        submission = validate_preflight({
+            "specialists": [
+                {
+                    "name": name,
+                    "findings": [{
+                        "id": "%s-001" % name.split("-")[0].upper(),
+                        "severity": "major",
+                        "category": {
+                            "swiftui-reviewer": "swiftui", "ux-critique": "ux",
+                            "resilience-auditor": "resilience",
+                        }[name],
+                        "location": "Sources/Feature.swift:42",
+                        "evidence": "the %s lens observed a concrete defect" % name,
+                        "required_outcome": "restore the expected observable behavior",
+                        "risk_flags": [],
+                    }] if name in findings_for else [],
+                }
+                for name in ("resilience-auditor", "swiftui-reviewer", "ux-critique")
+            ],
+        })
+        self.write_json("preflight.json", submission)
+        return submission
+
+    def test_the_summary_reads_the_preflight_envelope_init_writes(self):
+        """Regression: the reader still required the retired envelope's keys.
+
+        `init` writes `{"specialists": [...]}` and nothing else, so every real
+        iOS run was marked invalid here — the specialist counts vanished from
+        the summary and the recorded error blocked the knowledge candidate.
+        """
+        self.write_preflight_as_init_does(findings_for=("swiftui-reviewer", "ux-critique"))
+
+        result = generate_outputs(self.store, self.run.run_id)
+        text = self.output_text(result.final_summary)
+
+        self.assertIn("swiftui-reviewer", text)
+        self.assertNotIn("無法安全產生完整摘要", text)
+
+    def test_the_retired_preflight_envelope_is_refused_not_silently_read(self):
+        self.write_json("preflight.json", {
+            "profile": "ios", "patch_digest": "a" * 64,
+            "specialists": [
+                {"name": name, "findings": []}
+                for name in ("resilience-auditor", "swiftui-reviewer", "ux-critique")
+            ],
+        })
+
+        result = generate_outputs(self.store, self.run.run_id)
+        text = self.output_text(result.final_summary)
+
+        self.assertIn("無法安全產生完整摘要", text)
 
     def test_a_high_risk_pause_creates_a_bounded_knowledge_candidate(self):
         self.set_state(status=Status.PAUSED)
@@ -509,7 +559,7 @@ class DocSummaryTests(unittest.TestCase):
         (self.repo / "docs").mkdir(parents=True)
         subprocess.run(["git", "init", "-q", str(self.repo)], check=True)
         self.document = self.repo / "docs" / "rd-spec.md"
-        self.document.write_text("# 離線編輯\n\n使用者可以在離線時編輯內容。\n", encoding="utf-8")
+        self.document.write_text("# 多重授權\n\n使用者可以同時持有兩張授權。\n", encoding="utf-8")
         subprocess.run(["git", "-C", str(self.repo), "add", "."], check=True)
         subprocess.run([
             "git", "-C", str(self.repo), "-c", "user.email=test@example.com",
@@ -519,7 +569,7 @@ class DocSummaryTests(unittest.TestCase):
             ["git", "-C", str(self.repo), "rev-parse", "HEAD"],
             check=True, capture_output=True, text=True,
         ).stdout.strip()
-        self.brief = "離線編輯的 RD spec，給 PM 與 QA 讀"
+        self.brief = "多重授權的 RD spec，給 PM 與 QA 讀"
         self.lens_reason = "文件只描述使用者行為，沒有任何檔案路徑"
         self.store = RunStore(self.root / "runs")
         self.run = self.store.create(RunState.new_doc(self.manifest()))

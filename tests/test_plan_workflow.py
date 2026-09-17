@@ -162,6 +162,9 @@ class PlanWorkflowTests(unittest.TestCase):
             doc_max_initial_sources=5,
             doc_max_context_tokens=16000,
             codex_model="gpt-5.6-sol",
+            claude_model="opus[1m]",
+            claude_fallback_model="sonnet",
+            claude_max_budget_usd=5,
         )
 
     def tearDown(self):
@@ -294,9 +297,12 @@ class PlanWorkflowTests(unittest.TestCase):
         with self.assertRaises(RunnerInterrupted):
             self.workflow(InterruptedCodex(), FakeClaude()).run(self.run.run_id)
 
-        self.assertEqual(self.store.load(self.run.run_id).status, Status.PAUSED)
-        pause = json.loads((self.artifacts / "pause.json").read_text(encoding="utf-8"))
-        self.assertEqual(pause["reason"], "RUNNER_INTERRUPTED")
+        # An interruption says nothing about the work, so the run stays resumable
+        # rather than being voided along with every round it already finished.
+        self.assertEqual(self.store.load(self.run.run_id).status, Status.INTERRUPTED)
+        record = json.loads((self.artifacts / "interruption.json").read_text(encoding="utf-8"))
+        self.assertEqual(record["reason"], "RUNNER_INTERRUPTED")
+        self.assertFalse((self.artifacts / "pause.json").exists())
 
     def test_safe_cli_argument_category_is_retained_in_the_internal_pause_detail(self):
         class ArgumentFailureCodex:

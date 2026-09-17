@@ -31,7 +31,7 @@ class DocRunTests(unittest.TestCase):
         subprocess.run(["git", "init", "-q", str(self.repo)], check=True)
         self.doc = self.repo / "docs" / "rd-spec.md"
         self.doc.write_text(
-            "# 離線編輯\n\n使用者可以在離線時繼續編輯內容。\n", encoding="utf-8"
+            "# 多重授權\n\n使用者可以同時持有兩張有效授權。\n", encoding="utf-8"
         )
         self.plan = self.repo / "docs" / "plan.md"
         self.plan.write_text("# plan\n", encoding="utf-8")
@@ -45,7 +45,7 @@ class DocRunTests(unittest.TestCase):
             check=True, capture_output=True, text=True,
         ).stdout.strip()
         self.authority = ApprovalAuthority(self.root / "approval.key")
-        self.brief = "離線編輯的 RD spec，給 PM 與 QA 讀"
+        self.brief = "多重授權的 RD spec，給 PM 與 QA 讀"
         self.identity = executable_identity(Path(sys.executable))
         self.values = {
             "kind": "doc",
@@ -371,8 +371,8 @@ class DocRunTests(unittest.TestCase):
     def edited_document_digest(self):
         """Edit the document on disk and hash the new bytes independently."""
         self.doc.write_text(
-            "# 離線編輯\n\n使用者可以在離線時繼續編輯內容。\n\n"
-            "## 衝突\n兩邊都改過時以最後存檔為準。\n",
+            "# 多重授權\n\n使用者可以同時持有兩張有效授權。\n\n"
+            "## 到期\n第二張到期時第一張仍然有效。\n",
             encoding="utf-8",
         )
         return hashlib.sha256(self.doc.read_bytes()).hexdigest()

@@ -24,6 +24,9 @@ _REQUIRED_KEYS = {
     "doc_max_initial_sources",
     "doc_max_context_tokens",
     "codex_model",
+    "claude_model",
+    "claude_fallback_model",
+    "claude_max_budget_usd",
 }
 
 # The run kinds a context budget exists for.  ``context_limits`` refuses
@@ -47,7 +50,14 @@ _MAXIMUMS = {
 # argv element handed to a subprocess; it never reaches a shell, but a policy
 # file is the wrong place to accept arbitrary text, and refusing an
 # unvalidated value is this module's whole job.
-_MODEL_NAME = re.compile(r"[A-Za-z0-9._-]+")
+# Square brackets are allowed because the Claude CLI names its long-context
+# variants that way (``opus[1m]``); the class stays closed otherwise.
+_MODEL_NAME = re.compile(r"[A-Za-z0-9._\[\]-]+")
+
+# A repair that needs more than this has stopped being a repair.  It is a
+# ceiling, not a target: the observed runaway reached a 1M context over 43
+# minutes, and a bounded repair costs a small fraction of this.
+_MAX_REPAIR_BUDGET_USD = 50
 
 
 @dataclass(frozen=True)
@@ -67,6 +77,13 @@ class Policy:
     # the defect this field exists to close.  The pinned value has exactly one
     # home, config/defaults.yaml.
     codex_model: str
+    # The repair call states its own model for the same reason ``codex_model``
+    # exists: inheriting ~/.claude/settings.json means an unrelated edit there
+    # silently changes what every repair runs on.  The fallback covers an
+    # overloaded primary, and the budget bounds one call.
+    claude_model: str
+    claude_fallback_model: str
+    claude_max_budget_usd: int
 
     def context_limits(self, kind: str) -> Tuple[int, int]:
         """(max_sources, max_tokens) for the run kind."""
@@ -101,10 +118,17 @@ def _validate(contents: Any) -> Policy:
         isinstance(item, str) and item for item in excludes
     ):
         raise PolicyError("production_excludes must be a list of non-empty strings")
-    model = contents["codex_model"]
-    if type(model) is not str or not _MODEL_NAME.fullmatch(model):
+    for key in ("codex_model", "claude_model", "claude_fallback_model"):
+        model = contents[key]
+        if type(model) is not str or not _MODEL_NAME.fullmatch(model):
+            raise PolicyError(
+                "%s must be a non-empty name of letters, digits, '.', '-', '_', "
+                "or a bracketed variant" % key
+            )
+    budget = contents["claude_max_budget_usd"]
+    if type(budget) is not int or budget < 1 or budget > _MAX_REPAIR_BUDGET_USD:
         raise PolicyError(
-            "codex_model must be a non-empty name of letters, digits, '.', '-', or '_'"
+            "claude_max_budget_usd must be an integer from 1 to %d" % _MAX_REPAIR_BUDGET_USD
         )
     return Policy(**contents)
 

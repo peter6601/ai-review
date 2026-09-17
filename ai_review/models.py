@@ -18,13 +18,10 @@ from .process_security import executable_identity, resolve_executable, validate_
 
 
 VERIFICATION_POLICY = {
-    # v4 (2026-08-07): the macOS sandbox changed from "deny all network
-    # operations" to "deny both directions of IP networking, allow local unix
-    # domain sockets". See the profile comment in `runners.py` — the old value
-    # made every `xcodebuild test` on macOS unrunnable (testmanagerd speaks
-    # over a unix socket). This string is a behavior attestation signed into
-    # the manifest; when the behavior changes it must change with it, or the
-    # attestation is wrong.
+    # v4（2026-08-07）：macOS sandbox 從「拒絕所有 network 操作」改成「拒絕 IP 網路的
+    # 兩個方向、允許本機 unix domain socket」。理由見 `runners.py` 的 profile 註解——
+    # 舊值讓 macOS 上任何 `xcodebuild test` 都無法執行（testmanagerd 走 unix socket）。
+    # 這個字串是簽進 manifest 的行為宣告，行為改了就必須跟著改，否則是錯誤的 attestation。
     "version": 4,
     "macos_sandbox": "deny-ip-network-both-directions-allow-local-unix-sockets-and-deny-worktree-git-common-writes",
     "environment_keys": ["DEVELOPER_DIR", "HOME", "LANG", "LC_ALL", "PATH", "TMPDIR"],
@@ -381,6 +378,7 @@ class ReviewManifest:
     context_checksum: Optional[str] = None
     review_executables: Mapping[str, Any] = field(default_factory=dict)
     risk_policy_version: str = "review-risk-v1"
+    preflight_digest: Optional[str] = None
 
     def __post_init__(self) -> None:
         if self.kind != "review":
@@ -405,6 +403,11 @@ class ReviewManifest:
             r"[0-9a-f]{64}", self.context_checksum
         ):
             raise ValueError("context_checksum must be SHA-256 hex")
+        if self.preflight_digest is not None and (
+            not isinstance(self.preflight_digest, str)
+            or not re.fullmatch(r"[0-9a-f]{64}", self.preflight_digest)
+        ):
+            raise ValueError("preflight digest must be SHA-256 hex")
         if (
             not isinstance(self.risk_policy_version, str)
             or not self.risk_policy_version.strip()
@@ -435,7 +438,7 @@ class ReviewManifest:
         object.__setattr__(self, "review_executables", identities)
 
     def to_dict(self) -> dict:
-        return {
+        payload = {
             "kind": self.kind,
             "repo_path": self.repo_path,
             "base_ref": self.base_ref,
@@ -450,6 +453,14 @@ class ReviewManifest:
             "review_executables": self.review_executables,
             "risk_policy_version": self.risk_policy_version,
         }
+        # `digest()` serializes exactly this mapping and is signed into every
+        # approve-review receipt, so a run created before the specialist
+        # preflight existed must not grow a key here.  Omitting the field while
+        # it is unset is what keeps those stored manifests loadable and their
+        # recorded digests unchanged.
+        if self.preflight_digest is not None:
+            payload["preflight_digest"] = self.preflight_digest
+        return payload
 
     def digest(self) -> str:
         payload = json.dumps(self.to_dict(), sort_keys=True, separators=(",", ":"))
@@ -473,7 +484,9 @@ class ReviewManifest:
             "profile", "initial_patch_digest", "verification_commands", "knowledge_sources",
             "context_checksum", "review_executables", "risk_policy_version",
         }
-        if set(value) != expected:
+        # The preflight digest is the single optional key: a manifest stored
+        # before the specialist preflight existed carries no such key at all.
+        if set(value) - {"preflight_digest"} != expected:
             raise ValueError("review manifest fields are invalid")
         return cls(**value)
 

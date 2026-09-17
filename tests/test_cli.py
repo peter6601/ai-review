@@ -82,13 +82,18 @@ class CliContractTests(unittest.TestCase):
             }),
         )
 
-    def init_review(self, *extra, profile="ios"):
+    def init_review(self, *extra, profile="ios", preflight=True):
         self.plan.write_text("# Plan\nreview change\n", encoding="utf-8")
+        arguments = list(extra)
+        # An iOS run now carries the three specialists' findings from the start,
+        # so the helper supplies them unless a test is exercising their absence.
+        if profile == "ios" and preflight and "--preflight" not in arguments:
+            arguments += ["--preflight", str(self.preflight_file())]
         return self.cli(
             "init", "review", "--repo", str(self.repo), "--base", "HEAD",
             "--brief", "Review completed retry fix", "--profile", profile,
             "--verify", "%s -m unittest tests.test_retry" % sys.executable,
-            *extra,
+            *arguments,
         )
 
     def approved_review(self, *, profile="generic"):
@@ -166,6 +171,7 @@ class CliContractTests(unittest.TestCase):
                 "init", "review", "--repo", str(self.repo), "--base", base,
                 "--brief", "  Review completed retry fix  ", "--profile", "ios",
                 "--verify", "%s -m unittest tests.test_retry" % sys.executable,
+                "--preflight", str(self.preflight_file()),
             )
 
         self.assertEqual((code, stderr), (0, ""))
@@ -530,47 +536,7 @@ class CliContractTests(unittest.TestCase):
         self.assertIn("risk", stderr.lower())
         provider.assert_not_called()
 
-    def awaiting_preflight(self):
-        """Drive one iOS Review run to AWAITING_PREFLIGHT after the first Codex."""
-        run_id = self.approved_review(profile="ios")
-        factory, calls = self.review_factory(
-            [{
-                "verdict": "CHANGES_REQUIRED", "summary": "needs a fix",
-                "findings": [{
-                    "id": "CODE-001", "severity": "blocker", "invariant": "retry works",
-                    "location": "docs/plan.md:2", "evidence": "retry drops the stream",
-                    "required_outcome": "restore the stream",
-                    "lineage": {"resolution": "existing"},
-                }],
-                "questions": [], "context_requests": [],
-            }, {
-                "verdict": "PASS", "summary": "resolved", "findings": [],
-                "questions": [], "context_requests": [],
-            }],
-            [{
-                "summary": "repaired",
-                "resolutions": [
-                    {
-                        "finding_id": identifier, "outcome": "fixed",
-                        "evidence": "restored the documented retry behavior",
-                    }
-                    for identifier in (
-                        "CODE-001", "PF-SWIFTUI-SWIFTUI-001",
-                        "PF-UX-UX-001", "PF-RESILIENCE-RESILIENCE-001",
-                    )
-                ],
-                "risk_flags": [],
-            }],
-        )
-        code, stdout, stderr = self.cli("run", run_id, workflow_factory=factory)
-        self.assertEqual((code, stderr), (0, ""))
-        payload = json.loads(stdout)
-        self.assertEqual(payload["status"], "AWAITING_PREFLIGHT")
-        self.assertEqual(payload["next_action"], "submit_preflight")
-        request = json.loads(next(self.runs.rglob("preflight-request.json")).read_text())
-        return run_id, factory, calls, request
-
-    def preflight_file(self, patch_digest, *, findings=True, name="preflight.json"):
+    def preflight_file(self, *, findings=True, name="preflight.json"):
         specialists = []
         for specialist, category, prefix in (
             ("swiftui-reviewer", "swiftui", "SWIFTUI"),
@@ -588,81 +554,101 @@ class CliContractTests(unittest.TestCase):
                 }] if findings else [],
             })
         path = self.root / name
-        path.write_text(json.dumps({
-            "profile": "ios", "patch_digest": patch_digest, "specialists": specialists,
-        }), encoding="utf-8")
+        path.write_text(json.dumps({"specialists": specialists}), encoding="utf-8")
         return path
 
-    def test_submit_preflight_accepts_one_bound_submission_then_repairs_once(self):
-        run_id, factory, calls, request = self.awaiting_preflight()
-        findings = self.preflight_file(request["patch_digest"])
+    SPECIALISTS = ("resilience-auditor", "swiftui-reviewer", "ux-critique")
 
-        code, stdout, stderr = self.cli(
-            "submit-preflight", run_id, "--findings", str(findings),
-            workflow_factory=factory,
+    def test_ios_init_review_requires_a_preflight_file(self):
+        code, stdout, stderr = self.init_review(profile="ios", preflight=False)
+
+        self.assertEqual((code, stdout), (2, ""))
+        self.assertIn("preflight", stderr.lower())
+        self.assertEqual(list(self.runs.rglob("state.json")), [])
+
+    def test_generic_init_review_rejects_a_preflight_file(self):
+        code, stdout, stderr = self.init_review(
+            "--preflight", str(self.preflight_file()), profile="generic",
         )
+
+        self.assertEqual((code, stdout), (2, ""))
+        self.assertIn("preflight", stderr.lower())
+        self.assertEqual(list(self.runs.rglob("state.json")), [])
+
+    def test_ios_init_review_freezes_the_preflight_with_the_patch(self):
+        code, stdout, stderr = self.init_review(profile="ios")
 
         self.assertEqual((code, stderr), (0, ""))
-        self.assertEqual(json.loads(stdout)["status"], "AWAITING_HUMAN_CODE_REVIEW")
-        self.assertEqual(len(calls["repair"]), 1)
-        self.assertEqual(sorted(calls["repair"][0]["finding_ids"]), [
-            "CODE-001", "PF-RESILIENCE-RESILIENCE-001",
-            "PF-SWIFTUI-SWIFTUI-001", "PF-UX-UX-001",
-        ])
+        payload = json.loads(stdout)
+        self.assertEqual(payload["status"], "AWAITING_REVIEW_APPROVAL")
+        submission = json.loads(
+            next(self.runs.rglob("preflight.json")).read_text(encoding="utf-8")
+        )
+        self.assertEqual(set(submission), {"specialists"})
         self.assertEqual(
-            set(calls["repair"][0]["repair_lenses"]),
-            {"ios-distill", "code-simplifier", "ios-polish"},
+            tuple(item["name"] for item in submission["specialists"]), self.SPECIALISTS,
         )
-
-        second, output, error = self.cli(
-            "submit-preflight", run_id, "--findings", str(findings),
-            workflow_factory=factory,
+        normalized = json.loads(
+            next(self.runs.rglob("preflight-normalized.json")).read_text(encoding="utf-8")
         )
-        self.assertEqual((second, output), (2, ""))
-        self.assertIn("preflight", error.lower())
-        self.assertEqual(len(calls["repair"]), 1)
-
-    def test_submit_preflight_rejects_a_wrong_digest_and_a_malformed_file(self):
-        run_id, factory, calls, request = self.awaiting_preflight()
-        wrong = self.preflight_file("b" * 64, name="wrong.json")
-        duplicate = self.root / "duplicate.json"
-        duplicate.write_text(
-            '{"profile":"ios","profile":"ios","patch_digest":"%s","specialists":[]}'
-            % request["patch_digest"], encoding="utf-8",
+        self.assertEqual(len(normalized["findings"]), 3)
+        state = json.loads(next(self.runs.rglob("state.json")).read_text(encoding="utf-8"))
+        self.assertEqual(
+            state["manifest"]["preflight_digest"],
+            hashlib.sha256(json.dumps(
+                submission, sort_keys=True, separators=(",", ":"),
+            ).encode("utf-8")).hexdigest(),
         )
-        missing = self.root / "absent.json"
+        # The patch and the findings are frozen in the same breath.
+        self.assertTrue(next(self.runs.rglob("round-0000.patch")).exists())
 
-        for path in (wrong, duplicate, missing):
+    def test_a_malformed_preflight_file_creates_no_run(self):
+        legacy = self.root / "legacy.json"
+        legacy.write_text(json.dumps({
+            "profile": "ios", "patch_digest": "a" * 64,
+            "specialists": json.loads(
+                self.preflight_file(name="shape.json").read_text(encoding="utf-8")
+            )["specialists"],
+        }), encoding="utf-8")
+        missing = self.root / "missing.json"
+        missing.write_text(json.dumps({"specialists": json.loads(
+            self.preflight_file(name="shape.json").read_text(encoding="utf-8")
+        )["specialists"][:2]}), encoding="utf-8")
+        prose = self.root / "prose.json"
+        prose.write_text("the swiftui reviewer found nothing\n", encoding="utf-8")
+        relative = Path("preflight.json")
+
+        for path in (legacy, missing, prose, relative):
             with self.subTest(path=path.name):
-                code, stdout, stderr = self.cli(
-                    "submit-preflight", run_id, "--findings", str(path),
-                    workflow_factory=factory,
+                code, stdout, stderr = self.init_review(
+                    "--preflight", str(path), profile="ios",
                 )
                 self.assertEqual((code, stdout), (2, ""))
-                self.assertNotEqual(stderr, "")
+                self.assertIn("preflight", stderr.lower())
+                self.assertEqual(list(self.runs.rglob("state.json")), [])
 
-        self.assertEqual(len(calls["repair"]), 0)
-        self.assertEqual(list(self.runs.rglob("preflight.json")), [])
-
-    def test_submit_preflight_rejects_a_generic_run_and_an_oversized_file(self):
-        from ai_review.cli import MAX_PREFLIGHT_FILE_BYTES
-
-        generic_id = self.approved_review(profile="generic")
-        findings = self.preflight_file("c" * 64, name="generic.json")
-
+    def test_submit_preflight_is_no_longer_a_command(self):
         code, stdout, stderr = self.cli(
-            "submit-preflight", generic_id, "--findings", str(findings),
+            "submit-preflight", "any-run", "--findings", "/private/tmp/findings.json",
         )
-        self.assertEqual((code, stdout), (2, ""))
-        self.assertNotEqual(stderr, "")
 
-        oversized = self.root / "huge.json"
-        oversized.write_text("x" * (MAX_PREFLIGHT_FILE_BYTES + 1), encoding="utf-8")
-        code, stdout, stderr = self.cli(
-            "submit-preflight", generic_id, "--findings", str(oversized),
-        )
         self.assertEqual((code, stdout), (2, ""))
-        self.assertIn("size", stderr.lower())
+        self.assertIn("submit-preflight", stderr)
+
+    def test_status_still_reads_a_legacy_run_parked_at_awaiting_preflight(self):
+        """Stored runs are parked there; `status` must still describe them."""
+        run_id = self.approved_review(profile="ios")
+        state_path = next(self.runs.rglob("state.json"))
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state["status"] = "AWAITING_PREFLIGHT"
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+
+        code, stdout, stderr = self.cli("status", run_id)
+
+        self.assertEqual((code, stderr), (0, ""))
+        payload = json.loads(stdout)
+        self.assertEqual(payload["status"], "AWAITING_PREFLIGHT")
+        self.assertEqual(payload["next_action"], "stranded_preflight")
 
     def passed_review(self):
         """Drive one generic Review run to a terminal Codex PASS."""
@@ -743,7 +729,7 @@ class CliContractTests(unittest.TestCase):
             _writeback_knowledge(store, state, workspace_root=workspace)
         self.assertEqual(list(workspace.rglob("*.md")), [])
 
-    def test_a_learning_review_writes_back_only_under_the_second_brain(self):
+    def test_a_learning_review_writes_back_beside_the_generated_documents(self):
         run_id, _factory, _calls = self.passed_review()
         from ai_review.cli import _writeback_knowledge
 
@@ -775,6 +761,10 @@ class CliContractTests(unittest.TestCase):
             reloaded, reloaded.load(run_id), workspace_root=workspace,
         )
 
+        # One file per run is an event-tied artifact, and the vault's own
+        # decision tree keeps those out of 00_Core_Memory: it lands beside the
+        # other generated documents instead, for a human to promote into
+        # Topics/AI-Code-Review-實戰教訓.md if it earns a place there.
         self.assertEqual(
             written,
             workspace.resolve() / "second-brain" / "ai-review" / ("%s.md" % run_id),
@@ -784,6 +774,7 @@ class CliContractTests(unittest.TestCase):
             [path.relative_to(workspace).as_posix() for path in workspace.rglob("*.md")],
             ["second-brain/ai-review/%s.md" % run_id],
         )
+        self.assertEqual(list(workspace.glob("00_Core_Memory")), [])
 
     def test_changed_paths_is_nul_safe_for_spaces_and_newlines(self):
         from ai_review.git_diff import changed_paths
@@ -1102,7 +1093,7 @@ class CliContractTests(unittest.TestCase):
     def test_local_claude_uses_resolution_schema_for_plan_findings(self):
         from ai_review.cli import _LocalClaude
 
-        claude = _LocalClaude(self.repo)
+        claude = _LocalClaude(self.repo, model="opus[1m]", fallback_model="sonnet", max_budget_usd=5)
         claude._call = Mock(return_value={})
 
         claude.resolve({"findings": []})
@@ -1121,6 +1112,70 @@ class CliContractTests(unittest.TestCase):
 
         self.assertEqual(str(raised.exception), "CLI_ARG_ERROR exit=2")
         self.assertNotIn("do-not-leak", str(raised.exception))
+
+    def test_environment_failures_are_classified_from_stdout_not_only_stderr(self):
+        """Real defect: `claude -p` prints its API errors on stdout.
+
+        `_external_failure_detail` read stderr alone, where the CLI writes only
+        permission-rule warnings, so every one of these arrived as the same
+        opaque `EXTERNAL_EXIT exit=1` and the operator had nothing to act on.
+        """
+        from ai_review.cli import _run_external
+        from ai_review.runners import ExternalEnvironmentError, RunnerError
+
+        # The type carries the policy: an environment failure is resumable, and
+        # a model that returned data failing its schema is not.
+        cases = (
+            ("API Error: 529 {\"type\":\"overloaded_error\"}",
+             "EXTERNAL_OVERLOADED exit=1", ExternalEnvironmentError),
+            ("You've hit your org's monthly spend limit",
+             "EXTERNAL_SPEND_LIMIT exit=1", ExternalEnvironmentError),
+            ("Invalid API key · Please run /login",
+             "EXTERNAL_NOT_LOGGED_IN exit=1", ExternalEnvironmentError),
+            ("Response did not match the provided JSON schema",
+             "EXTERNAL_SCHEMA exit=1", RunnerError),
+        )
+        for stdout, expected, expected_type in cases:
+            with self.subTest(expected=expected):
+                with patch("ai_review.cli.subprocess.run", return_value=subprocess.CompletedProcess(
+                    ["claude"], 1, stdout, "permission rule warning",
+                )):
+                    with self.assertRaises(expected_type) as raised:
+                        _run_external(["claude", "-p"], self.repo)
+                self.assertEqual(str(raised.exception), expected)
+                self.assertIsInstance(raised.exception, expected_type)
+        # A terminal category must never arrive as a resumable one.
+        with patch("ai_review.cli.subprocess.run", return_value=subprocess.CompletedProcess(
+            ["claude"], 1, "Response did not match the provided JSON schema", "",
+        )):
+            with self.assertRaises(RunnerError) as raised:
+                _run_external(["claude", "-p"], self.repo)
+        self.assertNotIsInstance(raised.exception, ExternalEnvironmentError)
+
+    def test_a_classified_environment_failure_carries_no_model_output(self):
+        from ai_review.cli import _run_external
+        from ai_review.runners import ExternalEnvironmentError
+
+        with patch("ai_review.cli.subprocess.run", return_value=subprocess.CompletedProcess(
+            ["claude"], 1, "API Error: 529 overloaded for token=do-not-leak", "",
+        )):
+            with self.assertRaises(ExternalEnvironmentError) as raised:
+                _run_external(["claude", "-p"], self.repo)
+
+        self.assertEqual(str(raised.exception), "EXTERNAL_OVERLOADED exit=1")
+        self.assertNotIn("do-not-leak", str(raised.exception))
+
+    def test_an_unrecognized_failure_keeps_the_generic_category(self):
+        from ai_review.cli import _run_external
+        from ai_review.runners import RunnerError
+
+        with patch("ai_review.cli.subprocess.run", return_value=subprocess.CompletedProcess(
+            ["claude"], 1, "something nobody has a marker for", "",
+        )):
+            with self.assertRaises(RunnerError) as raised:
+                _run_external(["claude", "-p"], self.repo)
+
+        self.assertEqual(str(raised.exception), "EXTERNAL_EXIT exit=1")
 
     def test_local_codex_fails_closed_on_nonzero_exit_even_with_valid_output(self):
         from ai_review.cli import _LocalCodex
@@ -1202,9 +1257,9 @@ class CliContractTests(unittest.TestCase):
 
     # ---- doc run kind ----------------------------------------------------
 
-    DOC_BRIEF = "  離線編輯的 RD spec，給 PM 與 QA 讀  "
+    DOC_BRIEF = "  多重授權的 RD spec，給 PM 與 QA 讀  "
 
-    def write_doc(self, text="# 離線編輯\n\n使用者可在離線時編輯內容。\n"):
+    def write_doc(self, text="# 多重授權\n\n使用者可同時持有兩張授權。\n"):
         """Commit one document inside the repository and return its path."""
         document = self.repo / "docs" / "rd-spec.md"
         document.write_text(text, encoding="utf-8")
@@ -1585,8 +1640,8 @@ class CliContractTests(unittest.TestCase):
     # ---- re-review -------------------------------------------------------
 
     EDITED_DOC = (
-        "# 離線編輯\n\n使用者可在離線時編輯內容。\n\n"
-        "## 衝突\n兩邊都改過時，以最後存檔為準。\n"
+        "# 多重授權\n\n使用者可同時持有兩張授權。\n\n"
+        "## 到期\n第二張到期時，第一張仍然有效。\n"
     )
 
     def doc_finding(self, identifier):
@@ -1884,8 +1939,8 @@ class CliContractTests(unittest.TestCase):
     # state after the refusal, not merely the exit code.
 
     DOC_QUESTIONS = (
-        "功能上線後，既有使用者預設是否啟用離線編輯？",
-        "離線修改與雲端版本衝突時，應以哪一邊為準？",
+        "功能上線後，既有使用者預設繼續使用哪一張授權？",
+        "目前使用中的授權過期時，應自動改用哪一張授權？",
     )
 
     def doc_questions_review(self, *questions):
@@ -2010,7 +2065,7 @@ class CliContractTests(unittest.TestCase):
 
     def test_an_id_keyed_answers_file_still_resumes_the_run(self):
         run_id, codex = self.parked_doc_run(extra_responses=(self.doc_review(),))
-        payload = self.answers_file({"Q-001": "預設啟用", "Q-002": "以最後存檔為準"})
+        payload = self.answers_file({"Q-001": "預設沿用第一張", "Q-002": "自動改用下一張"})
 
         with patch("ai_review.cli.generate_outputs"):
             code, stdout, stderr = self.cli(
@@ -2026,17 +2081,17 @@ class CliContractTests(unittest.TestCase):
         ).read_text(encoding="utf-8"))
         self.assertEqual(
             submission["answers"],
-            {"Q-001": "預設啟用", "Q-002": "以最後存檔為準"},
+            {"Q-001": "預設沿用第一張", "Q-002": "自動改用下一張"},
         )
         # The answers reach the next Codex pass as decisions, keyed by id.
         self.assertIn("Q-001", codex.calls[1]["decision_log"])
-        self.assertIn("預設啟用", codex.calls[1]["decision_log"])
+        self.assertIn("預設沿用第一張", codex.calls[1]["decision_log"])
 
     def test_a_second_conflicting_submission_is_still_refused(self):
         """The CLI gate must not weaken the one immutable submission per pause."""
         run_id, codex = self.parked_doc_run(extra_responses=(self.doc_review(),))
         first = self.answers_file(
-            {"Q-001": "預設啟用", "Q-002": "以最後存檔為準"}, "first.json",
+            {"Q-001": "預設沿用第一張", "Q-002": "自動改用下一張"}, "first.json",
         )
         # A crash between the immutable submission and the state change: the
         # answers are persisted while the run is still awaiting input, which is
@@ -2057,7 +2112,7 @@ class CliContractTests(unittest.TestCase):
         self.assert_still_parked(run_id, before)
 
         second = self.answers_file(
-            {"Q-001": "預設關閉", "Q-002": "以最後存檔為準"}, "second.json",
+            {"Q-001": "改成最後一張", "Q-002": "自動改用下一張"}, "second.json",
         )
         code, stdout, stderr = self.cli(
             "answer", run_id, "--answers", second,

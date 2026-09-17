@@ -15,3 +15,10 @@ doc_max_context_tokens: 16000
 # ~/.codex/config.toml names: that file is outside this tool's control, and an
 # unrelated edit to it broke every run of all four kinds at once.
 codex_model: gpt-5.6-sol
+# The repair call names its model for the same reason: inheriting
+# ~/.claude/settings.json is how one repair ran 43 minutes at a 1M context and
+# then failed five schema validations in a row.  The fallback covers an
+# overloaded primary; the budget is the ceiling a smaller context used to give.
+claude_model: opus[1m]
+claude_fallback_model: sonnet
+claude_max_budget_usd: 5

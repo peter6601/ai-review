@@ -126,7 +126,7 @@ class DocWorkflowTests(unittest.TestCase):
         subprocess.run(["git", "init", "-q", str(self.repo)], check=True)
         self.document = self.repo / "docs" / "rd-spec.md"
         self.document.write_text(
-            "# 離線編輯\n\n使用者可以在離線時繼續編輯內容。\n", encoding="utf-8"
+            "# 多重授權\n\n使用者可以同時持有兩張有效授權。\n", encoding="utf-8"
         )
         subprocess.run(["git", "-C", str(self.repo), "add", "."], check=True)
         subprocess.run([
@@ -137,7 +137,7 @@ class DocWorkflowTests(unittest.TestCase):
             ["git", "-C", str(self.repo), "rev-parse", "HEAD"],
             check=True, capture_output=True, text=True,
         ).stdout.strip()
-        self.brief = "離線編輯的 RD spec，給 PM 與 QA 讀"
+        self.brief = "多重授權的 RD spec，給 PM 與 QA 讀"
         self.store = RunStore(self.root / "runs")
         self.run = self.store.create(RunState.new_doc(self.manifest()))
         self.claude = TripwireClaude()
@@ -153,6 +153,9 @@ class DocWorkflowTests(unittest.TestCase):
             doc_max_initial_sources=5,
             doc_max_context_tokens=16000,
             codex_model="gpt-5.6-sol",
+            claude_model="opus[1m]",
+            claude_fallback_model="sonnet",
+            claude_max_budget_usd=5,
         )
 
     # ---- fixtures -------------------------------------------------------
@@ -246,18 +249,18 @@ class DocWorkflowTests(unittest.TestCase):
         questions = json.loads((self.artifacts / "user-questions.json").read_text(encoding="utf-8"))
         self.assertEqual(questions["questions"][0]["id"], "Q-001")
 
-        result = workflow.answer(self.run.run_id, {"Q-001": "兩邊都保留"})
+        result = workflow.answer(self.run.run_id, {"Q-001": "兩張都保留"})
 
         self.assertEqual(result.status, Status.AWAITING_HUMAN_DOC_REVIEW)
         self.assertEqual(result.repair_round, 0)
         self.assertEqual(len(codex.calls), 2)
         self.assertEqual(self.claude.touches, [])
-        self.assertIn("兩邊都保留", codex.calls[1]["decision_log"])
+        self.assertIn("兩張都保留", codex.calls[1]["decision_log"])
         self.assertIn("Q-001", codex.calls[1]["decision_log"])
         answers = json.loads(
             (self.artifacts / "question-cycles" / "0001" / "answers.json").read_text(encoding="utf-8")
         )
-        self.assertEqual(answers["answers"], {"Q-001": "兩邊都保留"})
+        self.assertEqual(answers["answers"], {"Q-001": "兩張都保留"})
         self.assertDocumentUnchanged(before)
 
     def test_an_answered_doc_question_is_recorded_as_a_settled_decision(self):
@@ -276,7 +279,7 @@ class DocWorkflowTests(unittest.TestCase):
         workflow = self.workflow(codex)
         workflow.run(self.run.run_id)
 
-        workflow.answer(self.run.run_id, {"Q-001": "兩邊都保留"})
+        workflow.answer(self.run.run_id, {"Q-001": "兩張都保留"})
 
         decision_log = (self.artifacts / "decision-log.md").read_text(encoding="utf-8")
         self.assertNotIn("pending Claude Plan update", decision_log)
@@ -284,7 +287,7 @@ class DocWorkflowTests(unittest.TestCase):
             decision_log,
             "## Q-001\n"
             "- Question: Which tier keeps the second licence?\n"
-            "- Answer: 兩邊都保留\n"
+            "- Answer: 兩張都保留\n"
             "- Decision impact: settled user decision, binding on the document\n",
         )
 
@@ -297,7 +300,7 @@ class DocWorkflowTests(unittest.TestCase):
         workflow = self.workflow(codex)
         workflow.run(self.run.run_id)
 
-        workflow.answer(self.run.run_id, {"Q-001": "兩邊都保留"})
+        workflow.answer(self.run.run_id, {"Q-001": "兩張都保留"})
 
         delivered = codex.calls[1]["decision_log"]
         self.assertNotIn("pending Claude Plan update", delivered)
@@ -307,7 +310,7 @@ class DocWorkflowTests(unittest.TestCase):
         )
         # The question and the answer still reach the reviewer verbatim.
         self.assertIn("- Question: Which tier keeps the second licence?", delivered)
-        self.assertIn("- Answer: 兩邊都保留", delivered)
+        self.assertIn("- Answer: 兩張都保留", delivered)
 
     def test_context_request_expands_and_reviews_again(self):
         before = self.document.read_bytes()
@@ -641,7 +644,7 @@ class DocWorkflowTests(unittest.TestCase):
             review("NEEDS_USER_INPUT", findings=first, questions=["交易邊界是什麼？"]),
             review(
                 "NEEDS_USER_INPUT", findings=second,
-                questions=["fallback 候選是哪一個？"],
+                questions=["fallback 候選是哪一張？"],
             ),
         ])
         workflow = self.workflow(codex)
@@ -692,7 +695,7 @@ class DocWorkflowTests(unittest.TestCase):
         self.assertEqual(persisted["findings"], [])
         self.assertFalse((self.artifacts / "seen-findings.json").exists())
 
-        result = workflow.answer(self.run.run_id, {"Q-001": "兩邊都保留"})
+        result = workflow.answer(self.run.run_id, {"Q-001": "兩張都保留"})
 
         self.assertEqual(result.status, Status.AWAITING_HUMAN_DOC_REVIEW)
         self.assertEqual(len(codex.calls), 2)

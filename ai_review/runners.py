@@ -21,6 +21,21 @@ class RunnerInterrupted(RuntimeError):
     """A bounded external process did not finish before its deadline."""
 
 
+class ExternalEnvironmentError(RunnerInterrupted):
+    """An external call failed for a reason outside this run's control.
+
+    Overloaded, out of budget at the org level, not logged in, or unable to
+    start: none of these say anything about the work in progress, so the run
+    is interrupted and resumable rather than void.  It subclasses
+    ``RunnerInterrupted`` so every existing catch site treats it the same way
+    a timeout is treated.
+
+    Deliberately *not* in this class: a model that returned data failing its
+    schema, and a call stopped by this tool's own spend ceiling.  Both are
+    statements about the work, and both stay terminal.
+    """
+
+
 class RunnerError(RuntimeError):
     """A runner could not be started or returned an invalid structured result."""
 
@@ -92,21 +107,39 @@ def build_codex_argv(
 
 
 def build_claude_argv(
-    schema_json: str, prompt: str, *, mode: str = "code", executable: str = "claude"
+    schema_json: str, prompt: str, *, model: str, fallback_model: str,
+    max_budget_usd: int, mode: str = "code", executable: str = "claude",
 ) -> list[str]:
-    """Build a Claude request with an enforceable, Bash-free tool boundary."""
+    """Build a Claude request with an enforceable, Bash-free tool boundary.
+
+    ``model``, ``fallback_model`` and ``max_budget_usd`` are required and never
+    defaulted, for the reason ``build_codex_argv`` spells out: without ``--model``
+    the repair inherits ``~/.claude/settings.json``, so an unrelated edit there
+    silently changes what every repair runs on.  That inheritance is how one
+    repair ran 43 minutes at a 1M context and then failed five schema
+    validations in a row.  ``--fallback-model`` keeps an overloaded primary from
+    killing the run, and ``--max-budget-usd`` is the ceiling that a smaller
+    context used to provide implicitly.
+    """
     if not isinstance(schema_json, str) or not schema_json:
         raise ValueError("schema_json must be a non-empty string")
     if not isinstance(prompt, str) or not prompt:
         raise ValueError("prompt must be a non-empty string")
     if mode not in ("plan", "code", "review"):
         raise ValueError("Claude mode must be plan, code, or review")
+    for name, value in (("model", model), ("fallback model", fallback_model)):
+        if not isinstance(value, str) or not value:
+            raise ValueError("Claude %s must be a non-empty string" % name)
+    if type(max_budget_usd) is not int or max_budget_usd < 1:
+        raise ValueError("Claude budget must be a positive whole number of dollars")
     # Review repairs edit existing code, so they need exactly the Code-mode
     # boundary: file tools without Bash, and no permission bypass.
     tools = "Read,Glob,Grep" if mode == "plan" else "Read,Glob,Grep,Edit,Write"
     permission = "dontAsk" if mode == "plan" else "acceptEdits"
     return _argv([
         executable, "-p", "--safe-mode", "--permission-mode", permission,
+        "--model", model, "--fallback-model", fallback_model,
+        "--max-budget-usd", str(max_budget_usd),
         "--tools", tools, "--json-schema", schema_json, prompt,
     ])
 
@@ -189,28 +222,21 @@ def run_verification(argv: Sequence[str], *, cwd: Path, timeout: Optional[float]
             '(deny file-write* (subpath %s))' % json.dumps(str(path))
             for path in sorted(denied)
         )
-        # Deny BOTH directions of IP networking, but do NOT block unix domain
-        # sockets.
+        # 拒絕 IP 網路的**兩個方向**，但**不擋 unix domain socket**。
         #
-        # This used to be `(deny network*)`, and Seatbelt's `network*` blocks
-        # unix domain sockets too ⇒ no `xcodebuild test` can run on macOS: the
-        # simulator's XCTest must talk to testmanagerd over
-        # `/private/var/tmp/com.apple.launchd.*/com.apple.testmanagerd.unix-domain.socket`,
-        # and when that is blocked the build succeeds but the tests never
-        # execute, reporting only "Failed to establish communication with the
-        # test runner … Operation not permitted" (exit 65). ⇒ The entire iOS
-        # profile's verification was effectively unusable.
+        # 原本是 `(deny network*)`，而 Seatbelt 的 `network*` 連 unix domain socket 一起擋 ⇒
+        # macOS 上任何 `xcodebuild test` 都跑不起來：模擬器的 XCTest 必須經
+        # `/private/var/tmp/com.apple.launchd.*/com.apple.testmanagerd.unix-domain.socket`
+        # 與 testmanagerd 通訊，被擋時 build 成功但測試從未執行、只回
+        # 「Failed to establish communication with the test runner … Operation not permitted」
+        # （exit 65）。⇒ 整個 iOS profile 的 verification 形同無法使用。
         #
-        # A unix socket is local IPC and never leaves this machine, so the
-        # "deny network egress" intent is preserved. The only remaining
-        # indirect route is "proxy out through a local daemon" — but under
-        # `(allow default)` process spawning and mach-lookup are already wider
-        # channels, so the practical strength of this profile is unchanged.
+        # unix socket 是本機 IPC、不會離開這台機器，所以「拒絕網路外連」的意圖仍然保住。
+        # 唯一殘留的間接路徑是「經本機 daemon 代理出去」——但在 `(allow default)` 之下
+        # spawn process 與 mach-lookup 本來就是更寬的通道，這個 profile 的實際強度不變。
         #
-        # `network-bind` is deliberately not denied: with both directions
-        # denied a bare bind is not an exfiltration path, and denying it
-        # blocks the test runner's own local socket setup (measured: it falls
-        # back to the same failure).
+        # `network-bind` 刻意不擋：兩個方向都已拒絕，單純 bind 不構成外流路徑，
+        # 而加上它會擋掉測試執行器自己的本機 socket 設置（實測會退回同一個失敗）。
         profile = (
             '(version 1)(allow default)'
             '(deny network-outbound (remote ip "*:*"))'

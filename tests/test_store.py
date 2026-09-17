@@ -1,4 +1,5 @@
 import hashlib
+import json
 import os
 import subprocess
 import sys
@@ -555,6 +556,43 @@ class ReviewManifestTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             RunState(kind="plan", manifest=self.manifest())
 
+    # The 85 review runs already in the store were written without this field,
+    # and `digest()` is signed into every `approve-review` receipt, so a manifest
+    # that does not carry a preflight digest must serialize exactly as before.
+    LEGACY_REVIEW_MANIFEST_KEYS = frozenset({
+        "kind", "repo_path", "base_ref", "base_oid", "brief", "brief_digest",
+        "profile", "initial_patch_digest", "verification_commands",
+        "knowledge_sources", "context_checksum", "review_executables",
+        "risk_policy_version",
+    })
+
+    def test_review_manifest_without_preflight_digest_keeps_its_digest_and_shape(self):
+        before = self.manifest().to_dict()
+
+        self.assertEqual(set(before), self.LEGACY_REVIEW_MANIFEST_KEYS)
+        restored = ReviewManifest.from_dict(before)
+        self.assertEqual(restored.to_dict(), before)
+        self.assertEqual(
+            restored.digest(),
+            hashlib.sha256(
+                json.dumps(before, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            ).hexdigest(),
+        )
+
+    def test_review_manifest_with_preflight_digest_round_trips(self):
+        manifest = self.manifest(preflight_digest="a" * 64)
+        payload = manifest.to_dict()
+
+        self.assertEqual(payload["preflight_digest"], "a" * 64)
+        self.assertEqual(ReviewManifest.from_dict(payload), manifest)
+        self.assertNotEqual(manifest.digest(), self.manifest().digest())
+
+    def test_preflight_digest_must_be_sha256_hex_when_present(self):
+        for value in ("nope", "A" * 64, "a" * 63, "a" * 65, 1):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    self.manifest(preflight_digest=value)
+
 
 class PolicyTests(unittest.TestCase):
     def setUp(self):
@@ -572,6 +610,9 @@ class PolicyTests(unittest.TestCase):
             "doc_max_initial_sources": 5,
             "doc_max_context_tokens": 16000,
             "codex_model": "gpt-5.6-sol",
+            "claude_model": "opus",
+            "claude_fallback_model": "sonnet",
+            "claude_max_budget_usd": 3,
         }
 
     def tearDown(self):
@@ -631,6 +672,39 @@ class PolicyTests(unittest.TestCase):
 
         with self.assertRaises(PolicyError):
             load_policy(self.write_policy(policy))
+
+    def test_claude_repair_model_and_bounds_are_loaded_from_the_shipped_defaults(self):
+        """The repair call must state its model, not inherit ~/.claude/settings.json.
+
+        Inheriting it is how one repair ran 43 minutes at a 1M context and then
+        failed five schema validations in a row; the budget is the ceiling that
+        replaces the one a smaller context used to provide.
+        """
+        policy = load_policy(Path(__file__).parents[1] / "config" / "defaults.yaml")
+
+        self.assertEqual(policy.claude_model, "opus[1m]")
+        self.assertEqual(policy.claude_fallback_model, "sonnet")
+        self.assertEqual(policy.claude_max_budget_usd, 5)
+
+    def test_a_policy_cannot_be_built_without_the_claude_repair_settings(self):
+        for key in ("claude_model", "claude_fallback_model", "claude_max_budget_usd"):
+            with self.subTest(key=key):
+                values = dict(self.policy)
+                del values[key]
+                with self.assertRaises(PolicyError):
+                    load_policy(self.write_policy(values))
+
+    def test_a_claude_model_outside_the_argv_safe_allowlist_is_rejected(self):
+        for value in ("opus 1m", "opus;rm -rf /", "", "opus$(whoami)", 5):
+            with self.subTest(value=value):
+                with self.assertRaises(PolicyError):
+                    load_policy(self.write_policy(dict(self.policy, claude_model=value)))
+
+    def test_the_repair_budget_must_be_a_positive_bounded_number(self):
+        for value in (0, -1, "5", 1000):
+            with self.subTest(value=value):
+                with self.assertRaises(PolicyError):
+                    load_policy(self.write_policy(dict(self.policy, claude_max_budget_usd=value)))
 
     def test_codex_model_is_loaded_from_the_shipped_defaults(self):
         """The tool states its own model requirement instead of inheriting one.

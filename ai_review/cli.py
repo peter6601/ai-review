@@ -31,7 +31,14 @@ from .models import (
     canonical_user_question_ids, sign_risk_approval, strict_json_loads,
     verify_risk_approval,
 )
-from .runners import RunnerError, RunnerInterrupted, build_claude_argv, build_codex_argv, validate_codex_review
+from .runners import (
+    ExternalEnvironmentError,
+    RunnerError,
+    RunnerInterrupted,
+    build_claude_argv,
+    build_codex_argv,
+    validate_codex_review,
+)
 from .store import PRODUCTION_WORKSPACE_ROOT, RunStore, git_worktree_root
 from .summary import generate_outputs
 from .process_security import (
@@ -48,7 +55,13 @@ from .auto_approval import (
 )
 from .doc_workflow import DocWorkflow
 from .policy import Policy, load_policy
-from .preflight import PreflightError, load_preflight_text
+from .preflight import (
+    PreflightError,
+    load_preflight_text,
+    merged_source_ids,
+    normalized_findings,
+    validate_preflight,
+)
 from .review_workflow import DirectReviewWorkflow
 from .workflow import CodeWorkflow, PlanWorkflow
 
@@ -128,6 +141,9 @@ def _parser() -> argparse.ArgumentParser:
     review.add_argument("--base", required=True)
     review.add_argument("--brief", required=True)
     review.add_argument("--profile", choices=("generic", "ios"), required=True)
+    # Required for --profile ios and refused for generic, but enforced in
+    # _init_review rather than by argparse so the error can say which it is.
+    review.add_argument("--preflight")
     review.add_argument("--source", action="append", default=[])
     review.add_argument("--verify", action="append", default=[])
     # A doc run is one read-only pass over a document: it runs no command, so
@@ -173,9 +189,6 @@ def _parser() -> argparse.ArgumentParser:
             "--auto", action="store_true",
             help="approve as the agent, under the auto-approval rate limit",
         )
-    preflight = commands.add_parser("submit-preflight")
-    preflight.add_argument("run_id")
-    preflight.add_argument("--findings", required=True)
     writeback = commands.add_parser("writeback-knowledge")
     writeback.add_argument("run_id")
     status = commands.add_parser("status")
@@ -374,7 +387,7 @@ def _payload(store: RunStore, state: RunState) -> dict[str, Any]:
         Status.AWAITING_HUMAN_CODE_REVIEW.value: "human_code_review",
         Status.AWAITING_HUMAN_DOC_REVIEW.value: "human_doc_review",
         Status.AWAITING_REVIEW_APPROVAL.value: "human_review_scope",
-        Status.AWAITING_PREFLIGHT.value: "submit_preflight",
+        Status.AWAITING_PREFLIGHT.value: "stranded_preflight",
         Status.PAUSED.value: "human_decision",
         Status.INTERRUPTED.value: "resume",
     }
@@ -614,13 +627,17 @@ class _LocalCodex:
 
 class _LocalClaude:
     def __init__(
-        self, repo: Path, *, mode: str = "code",
-        identity: Optional[Mapping[str, Any]] = None,
+        self, repo: Path, *, model: str, fallback_model: str, max_budget_usd: int,
+        mode: str = "code", identity: Optional[Mapping[str, Any]] = None,
     ):
         self.repo = repo
         if mode not in ("plan", "code", "review"):
             raise ValueError("Claude mode must be plan, code, or review")
         self.mode = mode
+        # Required, never defaulted: see build_claude_argv.
+        self.model = model
+        self.fallback_model = fallback_model
+        self.max_budget_usd = max_budget_usd
         self.identity = dict(identity or resolve_executable("claude", path=os.environ.get("PATH")))
 
     @property
@@ -661,7 +678,12 @@ class _LocalClaude:
         mode = "plan" if schema_name == "claude-plan-update.schema.json" else self.mode
         executable = validate_executable_identity(self.identity)
         stdout = _run_external(
-            build_claude_argv(schema, prompt, mode=mode, executable=executable), self.repo
+            build_claude_argv(
+                schema, prompt, mode=mode, executable=executable,
+                model=self.model, fallback_model=self.fallback_model,
+                max_budget_usd=self.max_budget_usd,
+            ),
+            self.repo,
         )
         try:
             return strict_json_loads(stdout)
@@ -678,9 +700,12 @@ def _run_external(argv: list[str], cwd: Path) -> str:
     except subprocess.TimeoutExpired as error:
         raise RunnerInterrupted("external review timed out") from error
     except OSError as error:
-        raise RunnerError("external review could not start") from error
+        # The process never ran, so nothing changed and nothing is ambiguous.
+        raise ExternalEnvironmentError("external review could not start") from error
     if completed.returncode:
-        raise RunnerError(_external_failure_detail(completed.returncode, completed.stderr))
+        raise _external_failure(
+            completed.returncode, completed.stdout, completed.stderr,
+        )
     return completed.stdout
 
 
@@ -694,9 +719,12 @@ def _run_codex_with_output(argv: list[str], cwd: Path, output: Path, temporary_r
     except subprocess.TimeoutExpired as error:
         raise RunnerInterrupted("external review timed out") from error
     except OSError as error:
-        raise RunnerError("external review could not start") from error
+        # The process never ran, so nothing changed and nothing is ambiguous.
+        raise ExternalEnvironmentError("external review could not start") from error
     if completed.returncode:
-        raise RunnerError(_external_failure_detail(completed.returncode, completed.stderr))
+        raise _external_failure(
+            completed.returncode, completed.stdout, completed.stderr,
+        )
     try:
         result = _read_fresh_codex_output(output, temporary_root)
     except (OSError, ValueError) as error:
@@ -717,15 +745,57 @@ def _read_fresh_codex_output(output: Path, temporary_root: Path) -> Any:
     return validate_codex_review(strict_json_loads(candidate.read_text(encoding="utf-8")))
 
 
-def _external_failure_detail(exit_code: int, stderr: str) -> str:
-    """Keep a useful local failure category without retaining model/CLI output."""
-    normalized = stderr.lower() if isinstance(stderr, str) else ""
-    argument_markers = (
+# Markers are matched against stdout *and* stderr because the two CLIs disagree
+# about where a failure is printed: `codex` writes argument errors to stderr,
+# while `claude -p --json-schema` prints API and model errors to stdout and
+# leaves stderr for permission-rule warnings.  Reading stderr alone is what made
+# every Claude-side failure arrive as an opaque `EXTERNAL_EXIT exit=1`.
+# Order matters: the first match wins, so the specific categories precede the
+# generic argument check.
+_FAILURE_MARKERS = (
+    ("EXTERNAL_NOT_LOGGED_IN", (
+        "not logged in", "invalid api key", "please run /login", "authentication_error",
+    )),
+    ("EXTERNAL_BUDGET", ("exceeded usd budget",)),
+    ("EXTERNAL_SPEND_LIMIT", (
+        "spend limit", "usage limit", "monthly limit", "credit balance is too low",
+    )),
+    ("EXTERNAL_OVERLOADED", ("overloaded", "529", "rate_limit_error", "429")),
+    ("EXTERNAL_SCHEMA", (
+        "did not match the provided json schema", "does not match the schema",
+        "json schema validation failed", "output did not match",
+    )),
+    ("CLI_ARG_ERROR", (
         "unexpected argument", "unrecognized argument", "unknown option", "unknown argument",
         "invalid value", "requires a value", "found argument",
+    )),
+)
+
+
+# The categories that say nothing about the work in progress.  A run that hits
+# one of these is interrupted and resumable; everything else stays terminal.
+_RESUMABLE_CATEGORIES = frozenset({
+    "EXTERNAL_NOT_LOGGED_IN", "EXTERNAL_SPEND_LIMIT", "EXTERNAL_OVERLOADED",
+})
+
+
+def _external_failure(exit_code: int, stdout: str, stderr: str) -> RunnerError:
+    """Build the typed failure for one non-zero external exit."""
+    detail = _external_failure_detail(exit_code, stdout, stderr)
+    if detail.split(" ", 1)[0] in _RESUMABLE_CATEGORIES:
+        return ExternalEnvironmentError(detail)
+    return RunnerError(detail)
+
+
+def _external_failure_detail(exit_code: int, stdout: str, stderr: str) -> str:
+    """Keep a useful local failure category without retaining model/CLI output."""
+    streams = " ".join(
+        value.lower() for value in (stdout, stderr) if isinstance(value, str)
     )
-    category = "CLI_ARG_ERROR" if any(marker in normalized for marker in argument_markers) else "EXTERNAL_EXIT"
-    return "%s exit=%d" % (category, exit_code)
+    for category, markers in _FAILURE_MARKERS:
+        if any(marker in streams for marker in markers):
+            return "%s exit=%d" % (category, exit_code)
+    return "EXTERNAL_EXIT exit=%d" % exit_code
 
 
 def _default_workflow_factory(*, kind: str, store: RunStore, state: RunState, context_packet: Any = None) -> Any:
@@ -748,7 +818,12 @@ def _default_workflow_factory(*, kind: str, store: RunStore, state: RunState, co
             context_packet=context_packet,
         )
     codex = _LocalCodex(repo, identities.get("codex"), mode=kind, model=model)
-    claude = _LocalClaude(repo, mode=kind, identity=identities.get("claude"))
+    policy = _central_policy()
+    claude = _LocalClaude(
+        repo, mode=kind, identity=identities.get("claude"),
+        model=policy.claude_model, fallback_model=policy.claude_fallback_model,
+        max_budget_usd=policy.claude_max_budget_usd,
+    )
     if kind == "plan":
         return PlanWorkflow(store, codex, claude, context_packet=context_packet)
     if kind == "review":
@@ -954,6 +1029,11 @@ def _init_code(args: argparse.Namespace, store: RunStore) -> RunState:
 
 
 def _init_review(args: argparse.Namespace, store: RunStore) -> RunState:
+    # The three read-only specialists are session work that finishes before a run
+    # exists, so their findings are read, validated, and digested here.  Every
+    # rejection below happens before `store.create`, which is what keeps a
+    # malformed submission from leaving a runnable run behind.
+    submission = _review_preflight(args)
     repo = _resolve_repo(args.repo)
     base_oid = _oid(repo, args.base)
     refs = _source_refs(args.source)
@@ -976,15 +1056,48 @@ def _init_review(args: argparse.Namespace, store: RunStore) -> RunState:
             "codex": resolve_executable("codex", path=os.environ.get("PATH")),
             "claude": resolve_executable("claude", path=os.environ.get("PATH")),
         },
+        preflight_digest=_preflight_digest(submission) if submission is not None else None,
     )
     state = store.create(RunState.new_review(manifest))
     artifacts = store._run_directory(state)
     store.write_artifact_bytes(artifacts / "patches" / "round-0000.patch", patch_bytes)
+    if submission is not None:
+        # Same shape the in-loop submission used to leave behind, so summary.py
+        # and the risk detector keep reading one artifact layout.
+        store._atomic_write(artifacts / "preflight.json", submission)
+        store._atomic_write(artifacts / "preflight-normalized.json", {
+            "findings": list(normalized_findings(submission)),
+            "source_ids": merged_source_ids(submission),
+        })
     if packet is not None:
         PlanWorkflow(store, None, None, context_packet=packet)._persist_context_packet(
             artifacts, packet
         )
     return state
+
+
+def _review_preflight(args: argparse.Namespace) -> Optional[dict]:
+    """Return the validated specialist submission an iOS review must carry."""
+    if args.profile == "ios":
+        if not args.preflight:
+            raise CliInputError(
+                "an ios review requires --preflight with all three specialists' findings"
+            )
+    elif args.preflight:
+        raise CliInputError("a generic review takes no --preflight findings")
+    if not args.preflight:
+        return None
+    payload = _read_preflight_file(args.preflight)
+    try:
+        return validate_preflight(payload)
+    except PreflightError as error:
+        raise CliInputError(str(error)) from error
+
+
+def _preflight_digest(submission: Mapping[str, Any]) -> str:
+    return hashlib.sha256(
+        json.dumps(submission, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
 
 
 def _init_doc(args: argparse.Namespace, store: RunStore) -> RunState:
@@ -1168,7 +1281,7 @@ def _approve_review(args: argparse.Namespace, store: RunStore) -> RunState:
 MAX_PREFLIGHT_FILE_BYTES = 256 * 1024
 
 
-def _read_preflight_submission(path_text: str) -> Any:
+def _read_preflight_file(path_text: str) -> Any:
     """Read one bounded, regular specialist submission file."""
     path = Path(path_text).expanduser()
     if not path.is_absolute():
@@ -1469,6 +1582,9 @@ def _writeback_knowledge(
         raise CliInputError("canonical workspace is unavailable")
     descriptor = os.open(str(root), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try:
+        # One file per run is a generated artifact, so it lands in its own
+        # directory under the workspace rather than anywhere a person curates
+        # by hand; promoting what earns a place is a human step.
         for component in ("second-brain", "ai-review"):
             try:
                 child = os.open(component, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=descriptor)
@@ -1541,14 +1657,6 @@ def main(
             _answerable(state)
             answers = _checked_answers(store, state, answers)
             state = _workflow(store, state, workflow_factory).answer(state.run_id, answers)
-        elif args.command == "submit-preflight":
-            submission = _read_preflight_submission(args.findings)
-            state = store.load(args.run_id)
-            if state.kind != "review":
-                raise CliInputError("submit-preflight requires a Review run")
-            state = _workflow(store, state, workflow_factory).submit_preflight(
-                state.run_id, submission
-            )
         elif args.command == "re-review":
             # Rebind first, then run exactly as `run` does, so a second round
             # is backgroundable and resumable like every other long command.
@@ -1577,7 +1685,7 @@ def main(
         # payload and generated summary together with exit 3.
         try:
             interrupted = store.load(args.run_id)
-            if interrupted.status == Status.PAUSED:
+            if interrupted.status in (Status.PAUSED, Status.INTERRUPTED):
                 generate_outputs(store, interrupted.run_id)
                 _emit(_payload(store, interrupted))
         except (NameError, AttributeError, ValueError, OSError, RunnerError):

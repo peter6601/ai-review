@@ -23,11 +23,38 @@ class SkillContractTests(unittest.TestCase):
             "Codex-first",
             "sixth repair",
             "approve-code",
-            "submit-preflight",
+            "--preflight",
             "read-only",
             "8,000",
         ):
             self.assertIn(phrase, text)
+
+    def test_the_specialists_are_collected_before_the_run_exists(self):
+        """The 29 runs abandoned at AWAITING_PREFLIGHT died at a mid-run handoff.
+
+        There is no such station any more, so the skill must describe the
+        specialists as an input to `init` and must not describe a station that
+        no longer exists.
+        """
+        _, text = skill("consensus-review")
+
+        self.assertNotIn("submit-preflight", text)
+        self.assertNotIn("AWAITING_PREFLIGHT", text)
+        for phrase in (
+            "init review",
+            "--preflight",
+            # All three, every time: an empty findings list is a verdict.
+            "all three",
+            '"findings": []',
+        ):
+            self.assertIn(phrase, text)
+
+    def test_the_auto_approval_ledger_counts_the_two_gates_that_have_it(self):
+        """approve-code has no --auto, so the shared window covers two gates."""
+        _, text = skill("consensus-review")
+
+        self.assertNotIn("all three gates in one ledger", text)
+        self.assertIn("both gates that have it, in one ledger", text)
 
     def test_agent_auto_approval_is_documented_with_its_limit_and_its_cost(self):
         """`--auto` weakens a human gate, so the skill must say exactly how much."""
@@ -118,8 +145,6 @@ class CanonicalSkillFrontmatterTests(unittest.TestCase):
                 self.assertIn("name", frontmatter)
                 self.assertIn("description", frontmatter)
                 self.assertEqual(frontmatter["name"], name)
-
-
 class ConsensusPlanSkillContractTests(unittest.TestCase):
     """`/consensus-plan` drives read-only document review, not Plan review.
 
@@ -239,3 +264,4 @@ class ConsensusPlanSkillContractTests(unittest.TestCase):
         self.assertIn("non-deterministic", text)
         self.assertIn("needs no `claude` login", text)
         self.assertIn("separately billed Codex session", text)
+
