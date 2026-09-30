@@ -26,6 +26,15 @@ Command map, in order:
 5. `ai-review approve-code` — the human's final gate.
 6. `ai-review writeback-knowledge` — separate, never automatic.
 
+`ai-review queue` is read-only and outside that order: it lists every Code or
+Review run, across all repositories, that is parked at `AWAITING_HUMAN_CODE_REVIEW`
+— grouped by repository, with worktree, branch, waiting time, and summary path.
+`--format json` gives `pending_count` and `approvable_count`. A run marked
+`cannot approve` failed to load because a bound executable (`claude`, `codex`, or
+a verification tool such as Xcode) changed after `init`; `approve-code` will
+refuse it too. Use it to review asynchronously: park runs at the gate, then
+work through the queue in one sitting.
+
 Gates 2 and 4 accept `--auto`, which approves as you instead of waiting for a
 person; read **Auto-approval and its rate limit** before using it. Gate 5 does
 not, and never will.
@@ -197,7 +206,8 @@ ai-review resume "REVIEW_RUN_ID"
 Any further edit to the worktree invalidates that approval.
 
 **`PAUSED` with reason `MAX_REPAIR_ROUNDS`** — the six-repair ceiling. Terminal
-for automation. Report the remaining findings and hand the change to the human.
+for automation. Report the remaining findings and hand the change to the human,
+with a draft ruling for each one (see **Record the human's rulings**).
 Do **not** start a fresh `init review` for the same work; that would reset the
 counter and defeat the ceiling.
 
@@ -316,6 +326,32 @@ ai-review approve-code "REVIEW_RUN_ID"
 Approval binds the terminal Codex PASS, the current full patch, the passing
 verification snapshot, and the summary. Any worktree change after PASS
 invalidates it.
+
+### Record the human's rulings
+
+The signed approval proves a person read the diff; it does not say what they
+decided about each finding. With `--auto` clearing the scope and risk gates,
+`approve-code` is the only human judgment in the whole loop, so that decision
+must be written down.
+
+Before the human runs `approve-code`, draft one ruling per finding from the
+run's summary — every Codex and specialist finding across all rounds:
+
+- `accepted (fixed)` — the repair addressed it;
+- `rejected` — the human disagrees, with one sentence of reason;
+- `deferred` — real but out of scope, with where it will be tracked.
+
+Show the draft and let the human correct it; never finalize a ruling yourself.
+A `MAX_REPAIR_ROUNDS` handoff needs the same list for every remaining finding.
+
+The corrected list goes into the **PR description** — in a repository whose
+PR template is written for non-engineers, inside a closing `<details>` block so
+the reader-facing summary stays short — followed by one line:
+`Human code review: approved (YYYY-MM-DD) | run <RUN_ID>`.
+You never open the PR yourself, so hand the block to the human to paste, or keep
+it ready for whoever writes the description. A repository with no PRs records
+it in the feature's implementation log (or whatever record the repository
+keeps per change) instead. Without the ruling list, the review is not finished.
 
 A `knowledge-candidate.md` appears only when one of the six approved learning
 triggers holds: three or more repair rounds, a repeated invariant, a scope or

@@ -470,6 +470,47 @@ class RunStore:
         except (UnicodeDecodeError, json.JSONDecodeError) as error:
             raise ValueError("persisted run state is invalid") from error
 
+    def list_run_ids(self) -> list[str]:
+        """Every run id that has a regular state.json, read by descriptor, sorted."""
+        return [run_id for run_id, _path in self.list_state_paths()]
+
+    def list_state_paths(self) -> list[tuple[str, Path]]:
+        """``(run id, state.json path)`` for every run, found by descriptor, sorted."""
+        try:
+            root_fd = self._open_root(create=False)
+        except ValueError:
+            return []
+        runs: list[tuple[str, Path]] = []
+        try:
+            for project in os.listdir(root_fd):
+                if project in (".", ".."):
+                    continue
+                try:
+                    _validate_project_id(project)
+                    project_fd = self._open_directory(root_fd, (project,), create=False)
+                except (ValueError, FileNotFoundError, NotADirectoryError):
+                    continue
+                try:
+                    for run_id in os.listdir(project_fd):
+                        try:
+                            _validate_run_id(run_id)
+                            run_fd = self._open_directory(project_fd, (run_id,), create=False)
+                        except (ValueError, FileNotFoundError, NotADirectoryError):
+                            continue
+                        try:
+                            info = os.stat("state.json", dir_fd=run_fd, follow_symlinks=False)
+                            if stat.S_ISREG(info.st_mode):
+                                runs.append((run_id, self.root / project / run_id / "state.json"))
+                        except FileNotFoundError:
+                            pass
+                        finally:
+                            os.close(run_fd)
+                finally:
+                    os.close(project_fd)
+        finally:
+            os.close(root_fd)
+        return sorted(runs)
+
     def load_status(self, run_id: str) -> RunState:
         """Read a structurally valid public status without opening approval authority."""
         return self.load(run_id, verify_authority=False)

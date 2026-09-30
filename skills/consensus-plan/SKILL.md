@@ -165,6 +165,16 @@ sees what it asked for last time and whether the edit answered it. It refuses
 when the document has not changed: re-reading unchanged bytes buys another
 sample of the same reader, not progress.
 
+The carried list cannot tell "declined on purpose" from "not handled yet", so a
+finding the human rejects would come back every round. When the human decides
+not to act on a finding, have them record it in the document itself, under a
+section such as `## 已知取捨與不採納` (Known trade-offs and declined findings) —
+one line per finding: its ID, a short summary, and the reason. The next
+`re-review` reads the whole document, so Codex sees the decision instead of
+raising it again, and the reason outlives the run. Suggest the section and its
+wording when you hand the findings over; the human writes it, as with every
+other edit to the document.
+
 Never begin implementation from this skill. The deliverable is findings:
 never commit, push, merge, or open a pull request, and never edit the document
 yourself.

@@ -19,6 +19,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, NoReturn, Optional
 
@@ -193,6 +194,9 @@ def _parser() -> argparse.ArgumentParser:
     writeback.add_argument("run_id")
     status = commands.add_parser("status")
     status.add_argument("run_id")
+    # Read-only view across every repository: Code waiting for a person.
+    queue = commands.add_parser("queue")
+    queue.add_argument("--format", choices=("text", "json"), default="text")
     expansion = commands.add_parser("expand-context")
     expansion.add_argument("run_id")
     expansion.add_argument("--source", action="append", required=True)
@@ -370,6 +374,138 @@ def _status_store_from_args(args: argparse.Namespace) -> RunStore:
         return RunStore(Path(args.runs_root).expanduser().resolve())
     from .store import default_runs_root
     return RunStore(default_runs_root())
+
+
+def _git_output(path: Path, *arguments: str) -> Optional[str]:
+    try:
+        completed = run_git(
+            ["-C", str(path), *arguments], check=True,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+    except (OSError, subprocess.CalledProcessError, ValueError):
+        return None
+    return completed.stdout.strip() or None
+
+
+def _owning_repository(worktree: Path) -> Path:
+    """Group linked worktrees under the repository whose .git they share."""
+    common = _git_output(worktree, "rev-parse", "--path-format=absolute", "--git-common-dir")
+    if common is None:
+        return worktree
+    common_path = Path(common)
+    return common_path.parent if common_path.name == ".git" else common_path
+
+
+def _queue(store: RunStore) -> dict[str, Any]:
+    """Every Code or Review run parked at the human's gate, grouped by repository.
+
+    Listing reads the persisted fields directly, because a full load re-checks
+    the bound claude/codex/verification executables and refuses once any of
+    them has updated.  Those runs are exactly the ones a person most needs to
+    see, so each is listed with ``approvable`` saying whether ``approve-code``
+    can still load it.
+    """
+    repositories: dict[str, dict[str, Any]] = {}
+    unreadable = 0
+    for run_id, path in store.list_state_paths():
+        try:
+            raw = strict_json_loads(store.read_artifact_bytes(path).decode("utf-8"))
+            kind, status = raw["kind"], raw["status"]
+            manifest = raw["manifest"]
+            repo_path = manifest["repo_path"]
+        except (ValueError, OSError, UnicodeDecodeError, KeyError, TypeError):
+            unreadable += 1
+            continue
+        if kind not in ("code", "review") or status != Status.AWAITING_HUMAN_CODE_REVIEW.value:
+            continue
+        blocked: Optional[str] = None
+        state: Optional[RunState] = None
+        try:
+            state = store.load_status(run_id)
+        except (ValueError, OSError) as error:
+            blocked = _safe_error(error)
+        worktree = Path(repo_path)
+        exists = worktree.is_dir()
+        repository = _owning_repository(worktree) if exists else worktree
+        summary = None
+        if state is not None and exists:
+            try:
+                summary = _artifact_path(store, state, "final-summary.md")
+            except (ValueError, OSError):
+                summary = None
+        branch = _git_output(worktree, "branch", "--show-current") if exists else None
+        group = repositories.setdefault(str(repository), {
+            "repository": str(repository), "name": repository.name, "reviews": [],
+        })
+        group["reviews"].append({
+            "run_id": run_id,
+            "kind": kind,
+            "worktree": str(worktree),
+            "worktree_exists": exists,
+            "branch": branch,
+            "brief": manifest.get("brief"),
+            "waiting_since": raw.get("updated_at", ""),
+            "summary_path": summary,
+            "approvable": blocked is None and exists,
+            "blocked_reason": blocked if blocked is not None else (
+                None if exists else "worktree no longer exists"
+            ),
+        })
+    groups = sorted(repositories.values(), key=lambda group: group["name"])
+    for group in groups:
+        group["reviews"].sort(key=lambda review: review["waiting_since"])
+    return {
+        "pending_count": sum(len(group["reviews"]) for group in groups),
+        "approvable_count": sum(
+            1 for group in groups for review in group["reviews"] if review["approvable"]
+        ),
+        "repositories": groups,
+        "unreadable_runs": unreadable,
+    }
+
+
+def _waited(since: str, now: Optional[datetime] = None) -> str:
+    try:
+        started = datetime.fromisoformat(since)
+    except ValueError:
+        return since
+    seconds = max(0, int(((now or datetime.now(timezone.utc)) - started).total_seconds()))
+    if seconds >= 86400:
+        return "%dd" % (seconds // 86400)
+    if seconds >= 3600:
+        return "%dh" % (seconds // 3600)
+    return "%dm" % (seconds // 60)
+
+
+def _render_queue(queue: Mapping[str, Any], now: Optional[datetime] = None) -> str:
+    if not queue["pending_count"]:
+        lines = ["No Code is waiting for human review."]
+    else:
+        lines = ["%d waiting for human review, %d still approvable" % (
+            queue["pending_count"], queue["approvable_count"],
+        ), ""]
+        for group in queue["repositories"]:
+            lines.append("%s (%d)  %s" % (group["name"], len(group["reviews"]), group["repository"]))
+            for index, review in enumerate(group["reviews"]):
+                last = index == len(group["reviews"]) - 1
+                branch = review["branch"] or "(detached)"
+                lines.append("  %s %s  run %s  waiting %s" % (
+                    "└─" if last else "├─", branch, review["run_id"],
+                    _waited(review["waiting_since"], now),
+                ))
+                pad = "     " if last else "  │  "
+                if review["brief"]:
+                    brief = " ".join(review["brief"].split())
+                    lines.append(pad + (brief if len(brief) <= 72 else brief[:71] + "…"))
+                lines.append(pad + "worktree: " + review["worktree"])
+                if not review["approvable"]:
+                    lines.append(pad + "cannot approve: " + review["blocked_reason"])
+                if review["summary_path"]:
+                    lines.append(pad + "summary:  " + review["summary_path"])
+            lines.append("")
+    if queue["unreadable_runs"]:
+        lines.append("%d run(s) could not be read." % queue["unreadable_runs"])
+    return "\n".join(lines).rstrip("\n") + "\n"
 
 
 def _artifact_path(store: RunStore, state: RunState, relative: str) -> Optional[str]:
@@ -1626,7 +1762,15 @@ def main(
     """Run one command with injectable real-boundary factories for tests."""
     try:
         args = _parser().parse_args(argv)
-        store = status_store_factory(args) if args.command == "status" else store_factory(args)
+        read_only = args.command in ("status", "queue")
+        store = status_store_factory(args) if read_only else store_factory(args)
+        if args.command == "queue":
+            queue = _queue(store)
+            if args.format == "json":
+                _emit(queue)
+            else:
+                sys.stdout.write(_render_queue(queue))
+            return 0
         if args.command == "init":
             if args.kind == "plan":
                 state = _init_plan(args, store)

@@ -856,6 +856,97 @@ class CliContractTests(unittest.TestCase):
         self.assertEqual(stdout, "")
         self.assertIn("Plan is not human-approved", stderr)
 
+    def test_queue_is_empty_when_nothing_waits_for_a_person(self):
+        self.init_plan()
+
+        code, stdout, stderr = self.cli("queue", "--format", "json")
+
+        self.assertEqual((code, stderr), (0, ""))
+        payload = json.loads(stdout)
+        self.assertEqual(payload["pending_count"], 0)
+        self.assertEqual(payload["repositories"], [])
+        code, text, _stderr = self.cli("queue")
+        self.assertEqual(code, 0)
+        self.assertIn("No Code is waiting for human review.", text)
+
+    def test_queue_lists_code_parked_at_the_human_gate_grouped_by_repository(self):
+        run_id, _factory, _calls = self.passed_review()
+
+        code, stdout, stderr = self.cli("queue", "--format", "json")
+
+        self.assertEqual((code, stderr), (0, ""))
+        payload = json.loads(stdout)
+        self.assertEqual(payload["pending_count"], 1)
+        [group] = payload["repositories"]
+        self.assertEqual(Path(group["repository"]).resolve(), self.repo.resolve())
+        [review] = group["reviews"]
+        self.assertEqual(review["run_id"], run_id)
+        self.assertEqual(review["kind"], "review")
+        self.assertTrue(review["worktree_exists"])
+        self.assertEqual(review["brief"], "Review completed retry fix")
+        self.assertIsNotNone(review["summary_path"])
+        code, text, _stderr = self.cli("queue")
+        self.assertEqual(code, 0)
+        self.assertIn(run_id, text)
+        self.assertIn("1 waiting for human review, 1 still approvable", text)
+
+    def test_queue_still_lists_a_run_whose_bound_executable_changed(self):
+        run_id, _factory, _calls = self.passed_review()
+        state_path = next(self.runs.rglob("state.json"))
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state["manifest"]["review_executables"]["codex"]["sha256"] = "0" * 64
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+
+        code, stdout, stderr = self.cli("queue", "--format", "json")
+
+        self.assertEqual((code, stderr), (0, ""))
+        payload = json.loads(stdout)
+        self.assertEqual((payload["pending_count"], payload["approvable_count"]), (1, 0))
+        [review] = payload["repositories"][0]["reviews"]
+        self.assertEqual(review["run_id"], run_id)
+        self.assertFalse(review["approvable"])
+        self.assertTrue(review["blocked_reason"])
+        code, text, _stderr = self.cli("queue")
+        self.assertIn("cannot approve:", text)
+
+    def test_queue_skips_runs_that_are_not_waiting_for_code_review(self):
+        self.approved_review(profile="generic")
+
+        code, stdout, _stderr = self.cli("queue", "--format", "json")
+
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(stdout)["pending_count"], 0)
+
+    def test_queue_groups_a_linked_worktree_under_its_repository(self):
+        from ai_review.cli import _owning_repository
+
+        linked = self.root / "linked"
+        self.git("worktree", "add", "-b", "feature/queue", str(linked))
+
+        self.assertEqual(_owning_repository(linked).resolve(), self.repo.resolve())
+
+    def test_queue_does_not_mutate_run_bytes(self):
+        self.passed_review()
+        def snapshot():
+            return {
+                str(path): path.read_bytes() for path in sorted(self.runs.rglob("*")) if path.is_file()
+            }
+        before = snapshot()
+
+        code, _stdout, stderr = self.cli("queue")
+
+        self.assertEqual((code, stderr), (0, ""))
+        self.assertEqual(snapshot(), before)
+
+    def test_queue_renders_waiting_time_in_days_hours_and_minutes(self):
+        from datetime import datetime, timezone
+        from ai_review.cli import _waited
+
+        now = datetime(2026, 9, 30, 12, 0, tzinfo=timezone.utc)
+        self.assertEqual(_waited("2026-09-28T11:00:00+00:00", now), "2d")
+        self.assertEqual(_waited("2026-09-30T09:00:00+00:00", now), "3h")
+        self.assertEqual(_waited("2026-09-30T11:45:00+00:00", now), "15m")
+
     def test_status_does_not_mutate_run_bytes(self):
         _code, stdout, _stderr = self.init_plan()
         run_id = json.loads(stdout)["run_id"]
