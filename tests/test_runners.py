@@ -75,7 +75,7 @@ class ClaudeRepairBoundsTests(unittest.TestCase):
                                          "inode": 1, "size": 1},
         )
         with patch("ai_review.cli._run_external", return_value="{}") as external, patch(
-            "ai_review.cli.validate_executable_identity", return_value="claude",
+            "ai_review.cli.require_executable_identity", return_value="claude",
         ):
             claude.repair({"finding_ids": []})
 

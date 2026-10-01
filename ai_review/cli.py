@@ -43,8 +43,9 @@ from .runners import (
 from .store import PRODUCTION_WORKSPACE_ROOT, RunStore, git_worktree_root
 from .summary import generate_outputs
 from .process_security import (
-    controlled_env, executable_identity, resolve_executable, run_git,
-    validate_executable_identity,
+    controlled_env, executable_identity, require_executable_identity,
+    resolve_executable, restore_bound_executable_checks, run_git,
+    suspend_bound_executable_checks,
 )
 from .auto_approval import (
     AgentApprovalProvider,
@@ -753,7 +754,7 @@ class _LocalCodex:
             output = Path(raw) / "review.json"
             if output.exists() or output.is_symlink():
                 raise RunnerError("Codex output path was not fresh")
-            executable = validate_executable_identity(self.identity)
+            executable = require_executable_identity(self.identity)
             argv = build_codex_argv(
                 self.repo, schema, output, prompt,
                 model=self.model, executable=executable,
@@ -812,7 +813,7 @@ class _LocalClaude:
         prompt = (_ROOT / "prompts" / prompt_name).read_text(encoding="utf-8")
         prompt += "\n\nINPUT_JSON:\n" + json.dumps(inputs, ensure_ascii=False, sort_keys=True)
         mode = "plan" if schema_name == "claude-plan-update.schema.json" else self.mode
-        executable = validate_executable_identity(self.identity)
+        executable = require_executable_identity(self.identity)
         stdout = _run_external(
             build_claude_argv(
                 schema, prompt, mode=mode, executable=executable,
@@ -1752,6 +1753,12 @@ def _writeback_knowledge(
         os.close(descriptor)
 
 
+# These commands execute nothing but git, so a run whose bound claude/codex or
+# verification executable has since updated can still be read, approved, and
+# written back.  run/resume/answer/re-review/expand-context keep failing closed.
+_INSPECTION_COMMANDS = ("status", "queue", "approve-code", "writeback-knowledge")
+
+
 def main(
     argv: Optional[list[str]] = None,
     *,
@@ -1760,8 +1767,11 @@ def main(
     status_store_factory: Callable[[argparse.Namespace], RunStore] = _status_store_from_args,
 ) -> int:
     """Run one command with injectable real-boundary factories for tests."""
+    suspension = None
     try:
         args = _parser().parse_args(argv)
+        if args.command in _INSPECTION_COMMANDS:
+            suspension = suspend_bound_executable_checks()
         read_only = args.command in ("status", "queue")
         store = status_store_factory(args) if read_only else store_factory(args)
         if args.command == "queue":
@@ -1848,6 +1858,9 @@ def main(
     except (CliInputError, ValueError, OSError, RunnerError) as error:
         sys.stderr.write("ai-review: %s\n" % _safe_error(error))
         return EXIT_INVALID
+    finally:
+        if suspension is not None:
+            restore_bound_executable_checks(suspension)
 
 
 if __name__ == "__main__":

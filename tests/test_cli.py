@@ -890,11 +890,40 @@ class CliContractTests(unittest.TestCase):
         self.assertIn(run_id, text)
         self.assertIn("1 waiting for human review, 1 still approvable", text)
 
-    def test_queue_still_lists_a_run_whose_bound_executable_changed(self):
+    def codex_updated(self, run_id):
+        """Pretend the bound codex binary was replaced after the run reached PASS."""
+        from ai_review import process_security
+
+        state = json.loads(next(self.runs.rglob("state.json")).read_text(encoding="utf-8"))
+        codex_path = state["manifest"]["review_executables"]["codex"]["realpath"]
+        real_identity = process_security.executable_identity
+
+        def updated(path):
+            identity = real_identity(path)
+            if identity["realpath"] == codex_path:
+                identity = {**identity, "sha256": "0" * 64}
+            return identity
+
+        return patch("ai_review.process_security.executable_identity", side_effect=updated)
+
+    def test_queue_lists_a_run_whose_bound_executable_changed_as_still_approvable(self):
+        run_id, _factory, _calls = self.passed_review()
+
+        with self.codex_updated(run_id):
+            code, stdout, stderr = self.cli("queue", "--format", "json")
+
+        self.assertEqual((code, stderr), (0, ""))
+        payload = json.loads(stdout)
+        self.assertEqual((payload["pending_count"], payload["approvable_count"]), (1, 1))
+        [review] = payload["repositories"][0]["reviews"]
+        self.assertEqual(review["run_id"], run_id)
+        self.assertIsNotNone(review["summary_path"])
+
+    def test_queue_flags_a_run_whose_worktree_is_gone(self):
         run_id, _factory, _calls = self.passed_review()
         state_path = next(self.runs.rglob("state.json"))
         state = json.loads(state_path.read_text(encoding="utf-8"))
-        state["manifest"]["review_executables"]["codex"]["sha256"] = "0" * 64
+        state["manifest"]["repo_path"] = str(self.root / "deleted-worktree")
         state_path.write_text(json.dumps(state), encoding="utf-8")
 
         code, stdout, stderr = self.cli("queue", "--format", "json")
@@ -903,11 +932,51 @@ class CliContractTests(unittest.TestCase):
         payload = json.loads(stdout)
         self.assertEqual((payload["pending_count"], payload["approvable_count"]), (1, 0))
         [review] = payload["repositories"][0]["reviews"]
-        self.assertEqual(review["run_id"], run_id)
         self.assertFalse(review["approvable"])
         self.assertTrue(review["blocked_reason"])
         code, text, _stderr = self.cli("queue")
         self.assertIn("cannot approve:", text)
+
+    def test_approve_code_still_approves_after_a_bound_executable_updated(self):
+        run_id, _factory, _calls = self.passed_review()
+
+        with self.codex_updated(run_id):
+            (code, stdout, stderr), _scripts = self.approve_with_presence("approve-code", run_id)
+
+        self.assertEqual((code, stderr), (0, ""))
+        approval = json.loads(next(self.runs.rglob("code-approval.json")).read_text())
+        self.assertEqual(approval["run_id"], run_id)
+
+    def test_approve_code_after_an_update_still_refuses_a_changed_worktree(self):
+        run_id, _factory, _calls = self.passed_review()
+        (self.repo / "late.txt").write_text("edited after PASS\n", encoding="utf-8")
+
+        with self.codex_updated(run_id):
+            (code, _stdout, stderr), _scripts = self.approve_with_presence("approve-code", run_id)
+
+        self.assertEqual(code, 2)
+        self.assertIn("worktree changed", stderr)
+        self.assertFalse(list(self.runs.rglob("code-approval.json")))
+
+    def test_commands_that_execute_still_refuse_a_changed_executable(self):
+        run_id, factory, _calls = self.passed_review()
+
+        with self.codex_updated(run_id):
+            code, stdout, stderr = self.cli("resume", run_id, workflow_factory=factory)
+            status_code, _status, status_error = self.cli("status", run_id)
+
+        self.assertEqual((code, stdout), (2, ""))
+        self.assertIn("executable identity changed after it was bound", stderr)
+        self.assertEqual((status_code, status_error), (0, ""))
+
+    def test_inspection_does_not_leak_the_suspension_past_the_command(self):
+        from ai_review.process_security import bound_executable_checks_enabled
+
+        run_id, _factory, _calls = self.passed_review()
+        self.cli("status", run_id)
+        self.cli("queue")
+
+        self.assertTrue(bound_executable_checks_enabled())
 
     def test_queue_skips_runs_that_are_not_waiting_for_code_review(self):
         self.approved_review(profile="generic")

@@ -30,10 +30,15 @@ Command map, in order:
 Review run, across all repositories, that is parked at `AWAITING_HUMAN_CODE_REVIEW`
 — grouped by repository, with worktree, branch, waiting time, and summary path.
 `--format json` gives `pending_count` and `approvable_count`. A run marked
-`cannot approve` failed to load because a bound executable (`claude`, `codex`, or
-a verification tool such as Xcode) changed after `init`; `approve-code` will
-refuse it too. Use it to review asynchronously: park runs at the gate, then
-work through the queue in one sitting.
+`cannot approve` can no longer be approved — most often because its worktree was
+deleted. Use it to review asynchronously: park runs at the gate, then work
+through the queue when you have time.
+
+`approve-code`, `status`, `queue`, and `writeback-knowledge` execute nothing but
+git, so they still load a run whose bound `claude`, `codex`, or verification
+executable has updated since `init`: the review and verification evidence was
+produced while the identity matched. Every command that executes something —
+`run`, `resume`, `answer`, `expand-context` — still refuses that run.
 
 Gates 2 and 4 accept `--auto`, which approves as you instead of waiting for a
 person; read **Auto-approval and its rate limit** before using it. Gate 5 does
@@ -386,7 +391,8 @@ orchestrator executes the approved verification argv.
   `status`; a killed call leaves the run `INTERRUPTED`, which `resume` continues.
 - Executable identities for `claude` and `codex` are digest-bound at `init`. If
   either binary auto-updates mid-run, identity validation fails and the run must
-  be recreated — finish a run in one sitting.
+  be recreated — finish the automated loop in one sitting. A run already parked
+  at `AWAITING_HUMAN_CODE_REVIEW` is unaffected: the human can approve it later.
 - The inner `claude -p` repair starts from a scrubbed environment and
   authenticates from the Keychain, so `claude` must already be logged in from its
   own terminal; the host session's credentials are not inherited. It is a

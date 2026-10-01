@@ -14,7 +14,10 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Optional, Tuple, Union
 from .process_security import run_git
-from .process_security import executable_identity, resolve_executable, validate_executable_identity
+from .process_security import (
+    bound_executable_checks_enabled, executable_identity, resolve_executable,
+    validate_executable_identity,
+)
 
 
 VERIFICATION_POLICY = {
@@ -187,7 +190,11 @@ class VerificationCommand:
                 identity = None
         if identity is not None:
             executable = validate_executable_identity(identity)
-            if "/" in argv[0] and Path(argv[0]).resolve(strict=True) != Path(executable):
+            if (
+                bound_executable_checks_enabled()
+                and "/" in argv[0]
+                and Path(argv[0]).resolve(strict=True) != Path(executable)
+            ):
                 raise ValueError("verification argv does not match executable identity")
             argv = [executable, *argv[1:]]
         command = cls(

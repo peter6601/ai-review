@@ -37,7 +37,7 @@ from .runners import (
     validate_plan_update,
 )
 from .store import RunStore, git_worktree_root
-from .process_security import validate_executable_identity
+from .process_security import require_executable_identity
 
 
 class WorkflowError(ValueError):
@@ -1459,7 +1459,7 @@ class CodeWorkflow(PlanWorkflow):
             try:
                 if command.executable_identity is None:
                     raise RunnerError("verification executable has no signed identity")
-                executable = validate_executable_identity(command.executable_identity)
+                executable = require_executable_identity(command.executable_identity)
                 if executable != command.argv[0]:
                     raise RunnerError("verification executable identity does not match argv")
                 result = self.verification_runner(command.argv, cwd=repo, timeout=self.verification_timeout)
