@@ -2,6 +2,8 @@
 
 讓 **Codex 負責審查、Claude 負責修正、人類負責最後決定** 的本機工作流。
 
+想先看整體概念與實測數據，可以翻[簡報版](https://ios-dev-skill-deck.vercel.app/consensus/)：20 頁講完兩個入口、三道閘門，以及兩個月 152 個 run 踩過的坑。
+
 它提供兩個主要入口：
 
 | Skill | 適用情境 | 結果 |
