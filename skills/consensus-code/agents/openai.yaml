@@ -1,4 +1,0 @@
-interface:
-  display_name: "Consensus Code"
-  short_description: "Human-approved bounded code consensus"
-  default_prompt: "Use $consensus-code after I explicitly approve this reviewed Plan."
