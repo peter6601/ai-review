@@ -1028,7 +1028,7 @@ class PreflightSubmissionTests(unittest.TestCase):
         self.assertEqual(len(findings), 3)
         self.assertEqual(
             sorted(item["id"] for item in findings),
-            ["PF-RESILIENCE-RESILIENCE-001", "PF-SWIFTUI-SWIFTUI-001", "PF-UX-UX-001"],
+            ["PF-RESILIENCE-001", "PF-SWIFTUI-001", "PF-UX-001"],
         )
         for item in findings:
             self.assertEqual(set(item), {
@@ -1123,6 +1123,52 @@ class PreflightSubmissionTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.validate(base)
 
+    def envelope_with_swiftui_ids(self, *identifiers):
+        envelope = self.valid_envelope(findings_for=("swiftui-reviewer",))
+        template = envelope["specialists"][0]["findings"][0]
+        envelope["specialists"][0]["findings"] = [
+            dict(template, id=identifier, location="Sources/Feature.swift:%d" % (40 + index))
+            for index, identifier in enumerate(identifiers)
+        ]
+        return envelope
+
+    def test_a_category_prefixed_or_bare_id_queues_as_one_pf_id(self):
+        """Regression (2026-09-22).
+
+        The specialists number findings `SWIFTUI-101`, as their agent files and
+        the consensus-review skill document, and normalization prefixed that
+        verbatim into `PF-SWIFTUI-SWIFTUI-101`.  Claude's repair answered
+        `PF-SWIFTUI-101`, so a complete, verified repair paused as
+        INVALID_CLAUDE_RESOLUTION.  The category is written once, whichever
+        form the specialist used.
+        """
+        from ai_review.preflight import merged_source_ids, normalized_findings
+
+        for index, name in enumerate(SPECIALISTS):
+            token = name.split("-")[0].upper()
+            expected = "PF-%s-001" % token
+            for raw in ("%s-001" % token, "001", "%s-001" % token.lower(), expected):
+                with self.subTest(specialist=name, raw=raw):
+                    envelope = self.valid_envelope(findings_for=(name,))
+                    envelope["specialists"][index]["findings"][0]["id"] = raw
+                    submission = self.validate(envelope)
+
+                    self.assertEqual(
+                        [item["id"] for item in normalized_findings(submission)], [expected],
+                    )
+                    self.assertEqual(merged_source_ids(submission), {expected: [expected]})
+
+    def test_two_ids_that_queue_as_one_pf_id_are_rejected(self):
+        """`SWIFTUI-001` and `001` differ as text but would share one queue ID."""
+        with self.assertRaises(ValueError):
+            self.validate(self.envelope_with_swiftui_ids("SWIFTUI-001", "001"))
+
+    def test_an_id_naming_only_its_category_is_rejected(self):
+        for raw in ("SWIFTUI-", "PF-SWIFTUI-"):
+            with self.subTest(raw=raw):
+                with self.assertRaises(ValueError):
+                    self.validate(self.envelope_with_swiftui_ids(raw))
+
     def test_absolute_and_traversal_locations_are_rejected(self):
         for location in (
             "/Users/example/Sources/Feature.swift:1",
@@ -1163,7 +1209,7 @@ class IosPreflightWorkflowTests(ReviewWorkflowTestCase):
 
     profile = "ios"
 
-    def freeze_preflight(self, **kwargs):
+    def freeze_preflight(self, *, envelope=None, **kwargs):
         """Write exactly what `init review --preflight` leaves behind.
 
         Including the manifest digest: the artifacts alone are not the contract,
@@ -1173,7 +1219,9 @@ class IosPreflightWorkflowTests(ReviewWorkflowTestCase):
             merged_source_ids, normalized_findings, validate_preflight,
         )
 
-        submission = validate_preflight(preflight_envelope(**kwargs))
+        submission = validate_preflight(
+            envelope if envelope is not None else preflight_envelope(**kwargs)
+        )
         digest = hashlib.sha256(json.dumps(
             submission, sort_keys=True, separators=(",", ":"),
         ).encode("utf-8")).hexdigest()
@@ -1199,7 +1247,7 @@ class IosPreflightWorkflowTests(ReviewWorkflowTestCase):
         self.freeze_preflight(findings_for=SPECIALISTS)
         codex = FakeCodex([review("PASS"), review("PASS")])
         claude = FakeClaude(repairs=[repair_result(
-            "PF-SWIFTUI-SWIFTUI-001", "PF-UX-UX-001", "PF-RESILIENCE-RESILIENCE-001",
+            "PF-SWIFTUI-001", "PF-UX-001", "PF-RESILIENCE-001",
         )])
 
         result = self.workflow(codex=codex, claude=claude, verification=self.green).run(
@@ -1213,8 +1261,36 @@ class IosPreflightWorkflowTests(ReviewWorkflowTestCase):
         decision = self.merged_review()
         self.assertEqual(decision["verdict"], "CHANGES_REQUIRED")
         self.assertEqual(sorted(item["id"] for item in decision["findings"]), [
-            "PF-RESILIENCE-RESILIENCE-001", "PF-SWIFTUI-SWIFTUI-001", "PF-UX-UX-001",
+            "PF-RESILIENCE-001", "PF-SWIFTUI-001", "PF-UX-001",
         ])
+
+    def test_a_repair_answering_the_queued_pf_ids_passes_validation(self):
+        """Regression (2026-09-22): the ID Claude receives is the ID it answers.
+
+        The documented `SWIFTUI-001` and a bare `001` both reach the repair as
+        `PF-SWIFTUI-001`, so a resolution naming exactly that is accepted
+        instead of pausing as INVALID_CLAUDE_RESOLUTION.
+        """
+        queued = ["PF-RESILIENCE-001", "PF-SWIFTUI-001", "PF-UX-001"]
+        for form in ("documented", "bare"):
+            with self.subTest(form=form):
+                self.setUp()
+                envelope = preflight_envelope(findings_for=SPECIALISTS)
+                if form == "bare":
+                    envelope["specialists"][0]["findings"][0]["id"] = "001"
+                self.freeze_preflight(envelope=envelope)
+                codex = FakeCodex([review("PASS"), review("PASS")])
+                claude = FakeClaude(repairs=[repair_result(*queued)])
+
+                result = self.workflow(
+                    codex=codex, claude=claude, verification=self.green,
+                ).run(self.run.run_id)
+
+                self.assertEqual(sorted(claude.repair_calls[0]["finding_ids"]), queued)
+                self.assertEqual(result.status, Status.AWAITING_HUMAN_CODE_REVIEW)
+                self.assertEqual(
+                    sorted(item["id"] for item in self.merged_review()["findings"]), queued,
+                )
 
     def test_a_legacy_run_parked_at_awaiting_preflight_never_resumes(self):
         """Regression: retiring the command must not unlock the runs it stranded.
@@ -1254,7 +1330,7 @@ class IosPreflightWorkflowTests(ReviewWorkflowTestCase):
         self.write_artifact("preflight-normalized.json", {"findings": [], "source_ids": {}})
         codex = FakeCodex([review("PASS"), review("PASS")])
         claude = FakeClaude(repairs=[repair_result(
-            "PF-SWIFTUI-SWIFTUI-001", "PF-UX-UX-001", "PF-RESILIENCE-RESILIENCE-001",
+            "PF-SWIFTUI-001", "PF-UX-001", "PF-RESILIENCE-001",
         )])
 
         result = self.workflow(codex=codex, claude=claude, verification=self.green).run(
@@ -1263,7 +1339,7 @@ class IosPreflightWorkflowTests(ReviewWorkflowTestCase):
 
         self.assertEqual(result.status, Status.AWAITING_HUMAN_CODE_REVIEW)
         self.assertEqual(sorted(item["id"] for item in self.merged_review()["findings"]), [
-            "PF-RESILIENCE-RESILIENCE-001", "PF-SWIFTUI-SWIFTUI-001", "PF-UX-UX-001",
+            "PF-RESILIENCE-001", "PF-SWIFTUI-001", "PF-UX-001",
         ])
 
     def test_a_missing_or_altered_signed_preflight_fails_closed(self):
@@ -1291,7 +1367,7 @@ class IosPreflightWorkflowTests(ReviewWorkflowTestCase):
         (self.artifacts / "preflight-normalized.json").unlink()
         codex = FakeCodex([review("PASS"), review("PASS")])
         claude = FakeClaude(repairs=[repair_result(
-            "PF-SWIFTUI-SWIFTUI-001", "PF-UX-UX-001", "PF-RESILIENCE-RESILIENCE-001",
+            "PF-SWIFTUI-001", "PF-UX-001", "PF-RESILIENCE-001",
         )])
 
         result = self.workflow(codex=codex, claude=claude, verification=self.green).run(
@@ -1307,8 +1383,8 @@ class IosPreflightWorkflowTests(ReviewWorkflowTestCase):
             review("CHANGES_REQUIRED", findings=[blocker("CODE-001")]), review("PASS"),
         ])
         claude = FakeClaude(repairs=[repair_result(
-            "CODE-001", "PF-SWIFTUI-SWIFTUI-001", "PF-UX-UX-001",
-            "PF-RESILIENCE-RESILIENCE-001",
+            "CODE-001", "PF-SWIFTUI-001", "PF-UX-001",
+            "PF-RESILIENCE-001",
         )])
 
         result = self.workflow(codex=codex, claude=claude, verification=self.green).run(
@@ -1326,7 +1402,7 @@ class IosPreflightWorkflowTests(ReviewWorkflowTestCase):
         self.freeze_preflight(findings_for=SPECIALISTS)
         codex = FakeCodex([review("PASS"), review("PASS")])
         claude = FakeClaude(repairs=[repair_result(
-            "PF-SWIFTUI-SWIFTUI-001", "PF-UX-UX-001", "PF-RESILIENCE-RESILIENCE-001",
+            "PF-SWIFTUI-001", "PF-UX-001", "PF-RESILIENCE-001",
         )])
 
         self.workflow(codex=codex, claude=claude, verification=self.green).run(
@@ -1374,7 +1450,7 @@ class IosPreflightWorkflowTests(ReviewWorkflowTestCase):
             review("CHANGES_REQUIRED", findings=[blocker("CODE-001")]), review("PASS"),
         ])
         claude = FakeClaude(repairs=[repair_result(
-            "CODE-001", "PF-SWIFTUI-SWIFTUI-001", "PF-UX-UX-001", "PF-RESILIENCE-RESILIENCE-001",
+            "CODE-001", "PF-SWIFTUI-001", "PF-UX-001", "PF-RESILIENCE-001",
         )])
 
         result = self.workflow(codex=codex, claude=claude, verification=self.green).run(
@@ -1386,8 +1462,8 @@ class IosPreflightWorkflowTests(ReviewWorkflowTestCase):
         self.assertEqual(len(claude.repair_calls), 1)
         inputs = claude.repair_calls[0]
         self.assertEqual(sorted(inputs["finding_ids"]), [
-            "CODE-001", "PF-RESILIENCE-RESILIENCE-001",
-            "PF-SWIFTUI-SWIFTUI-001", "PF-UX-UX-001",
+            "CODE-001", "PF-RESILIENCE-001",
+            "PF-SWIFTUI-001", "PF-UX-001",
         ])
         self.assertEqual(
             set(inputs["repair_lenses"]), {"ios-distill", "code-simplifier", "ios-polish"}
@@ -1404,7 +1480,7 @@ class IosPreflightWorkflowTests(ReviewWorkflowTestCase):
             review("PASS"),
         ])
         claude = FakeClaude(repairs=[
-            repair_result("CODE-001", "PF-SWIFTUI-SWIFTUI-001"),
+            repair_result("CODE-001", "PF-SWIFTUI-001"),
             repair_result("CODE-002"),
         ])
 
@@ -1456,16 +1532,16 @@ class IosPreflightWorkflowTests(ReviewWorkflowTestCase):
         state_path.write_text(json.dumps(persisted), encoding="utf-8")
 
         resumed = FakeClaude(repairs=[repair_result(
-            "CODE-001", "PF-SWIFTUI-SWIFTUI-001", "PF-UX-UX-001",
-            "PF-RESILIENCE-RESILIENCE-001",
+            "CODE-001", "PF-SWIFTUI-001", "PF-UX-001",
+            "PF-RESILIENCE-001",
         )])
         self.workflow(
             codex=FakeCodex([review("PASS")]), claude=resumed, verification=self.green,
         ).run(self.run.run_id)
 
         self.assertEqual(sorted(resumed.repair_calls[0]["finding_ids"]), [
-            "CODE-001", "PF-RESILIENCE-RESILIENCE-001",
-            "PF-SWIFTUI-SWIFTUI-001", "PF-UX-UX-001",
+            "CODE-001", "PF-RESILIENCE-001",
+            "PF-SWIFTUI-001", "PF-UX-001",
         ])
 
     def test_specialist_risk_flags_reach_the_deterministic_risk_detector(self):
@@ -1477,7 +1553,7 @@ class IosPreflightWorkflowTests(ReviewWorkflowTestCase):
 
         codex = FakeCodex([review("CHANGES_REQUIRED", findings=[blocker("CODE-001")])])
         claude = FakeClaude(
-            repairs=[repair_result("CODE-001", "PF-UX-UX-001")], on_repair=touch_lockfile,
+            repairs=[repair_result("CODE-001", "PF-UX-001")], on_repair=touch_lockfile,
         )
 
         result = self.workflow(codex=codex, claude=claude, verification=self.green).run(
@@ -1806,14 +1882,14 @@ class IosPreflightIntegrityTests(ReviewWorkflowTestCase):
         mapping = merged_source_ids(submission)
 
         self.assertEqual(len(findings), 1)
-        self.assertEqual(findings[0]["id"], "PF-SWIFTUI-SWIFTUI-001")
+        self.assertEqual(findings[0]["id"], "PF-SWIFTUI-001")
         # Nothing is discarded: the merged finding names the other source ID,
         # takes the highest severity, and the mapping records both.
-        self.assertIn("PF-SWIFTUI-SWIFTUI-002", findings[0]["evidence"])
+        self.assertIn("PF-SWIFTUI-002", findings[0]["evidence"])
         self.assertEqual(findings[0]["severity"], "blocker")
         self.assertEqual(
-            mapping["PF-SWIFTUI-SWIFTUI-001"],
-            ["PF-SWIFTUI-SWIFTUI-001", "PF-SWIFTUI-SWIFTUI-002"],
+            mapping["PF-SWIFTUI-001"],
+            ["PF-SWIFTUI-001", "PF-SWIFTUI-002"],
         )
         self.assertEqual(set(findings[0]), {
             "id", "severity", "invariant", "location", "evidence",
@@ -1831,7 +1907,7 @@ class IosPreflightIntegrityTests(ReviewWorkflowTestCase):
         self.assertEqual(len(findings), 3)
         self.assertEqual(
             sorted(item["id"] for item in findings),
-            ["PF-RESILIENCE-RESILIENCE-001", "PF-SWIFTUI-SWIFTUI-001", "PF-UX-UX-001"],
+            ["PF-RESILIENCE-001", "PF-SWIFTUI-001", "PF-UX-001"],
         )
 
 

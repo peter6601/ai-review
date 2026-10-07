@@ -4,7 +4,7 @@ Fix the supplied normalized findings and any failing verification evidence in th
 
 Scope:
 
-- Fix only the supplied findings and the supplied failing verification evidence. Report one resolution per finding ID, using exactly the supplied IDs.
+- Fix only the supplied findings and the supplied failing verification evidence. Report one resolution for every ID in `finding_ids`, copying each ID into `finding_id` character for character. Never shorten, re-prefix, or correct an ID, even one that looks redundant: resolutions are matched to IDs byte for byte, and any mismatch pauses the run.
 - You may modify any file inside the supplied repository when that is required for a correct, bounded fix, including files absent from the reviewed patch.
 - Never modify `.git`, anything outside the supplied repository, or review run storage.
 - Preserve behavior the review brief does not cover. Do not refactor, rename, reformat, or restructure unrelated code.

@@ -107,6 +107,23 @@ def _validated_finding(value: Any, specialist: str) -> dict:
     }
 
 
+def _queued_id(specialist: str, identifier: str) -> str:
+    """Return the repair-queue ID for one specialist finding.
+
+    The specialists number findings ``SWIFTUI-001``, as their agent files and
+    the consensus-review skill document.  Prefixing that verbatim produced
+    ``PF-SWIFTUI-SWIFTUI-001``, which a repair "corrected" to ``PF-SWIFTUI-001``
+    and so resolved no queued finding (2026-09-22).  The category is therefore
+    written once: ``SWIFTUI-001``, ``001``, and ``PF-SWIFTUI-001`` all queue as
+    ``PF-SWIFTUI-001``.
+    """
+    prefix = SPECIALIST_ID_PREFIXES[specialist]
+    for written in (prefix, prefix[len("PF-"):]):
+        if identifier[:len(written)].upper() == written:
+            return prefix + identifier[len(written):]
+    return prefix + identifier
+
+
 def validate_preflight(payload: Any) -> dict:
     """Return the one normalized submission, ordered by required specialist."""
     if not isinstance(payload, dict) or set(payload) != {"specialists"}:
@@ -116,6 +133,7 @@ def validate_preflight(payload: Any) -> dict:
         raise PreflightError("preflight submission requires exactly three specialists")
     normalized = {}
     identifiers = set()
+    queued = set()
     for entry in specialists:
         if not isinstance(entry, dict) or set(entry) != {"name", "findings"}:
             raise PreflightError("preflight specialist has unknown or missing keys")
@@ -133,6 +151,12 @@ def validate_preflight(payload: Any) -> dict:
             if item["id"] in identifiers:
                 raise PreflightError("preflight finding ids must be unique")
             identifiers.add(item["id"])
+            queued_id = _queued_id(name, item["id"])
+            if queued_id == SPECIALIST_ID_PREFIXES[name]:
+                raise PreflightError("preflight finding id must number the finding")
+            if queued_id in queued:
+                raise PreflightError("preflight finding ids must stay unique once prefixed")
+            queued.add(queued_id)
             validated.append(item)
         normalized[name] = validated
     if set(normalized) != set(REQUIRED_SPECIALISTS):
@@ -152,8 +176,9 @@ def normalized_findings(submission: Mapping[str, Any]) -> tuple[dict, ...]:
     """Translate specialist findings into the existing Codex finding shape.
 
     IDs are prefixed per specialist so a repair resolution can never confuse a
-    Codex finding with a specialist one, and the source lens stays visible in the
-    evidence text because the review schema's lineage carries only a resolution.
+    Codex finding with a specialist one (see :func:`_queued_id` for why the
+    category appears once), and the source lens stays visible in the evidence
+    text because the review schema's lineage carries only a resolution.
 
     Two lenses describing the exact same ``(category, location, required_outcome)``
     describe one repair, so they merge into one finding.  Nothing is discarded:
@@ -164,10 +189,9 @@ def normalized_findings(submission: Mapping[str, Any]) -> tuple[dict, ...]:
     merged: dict[tuple[str, str, str], dict] = {}
     for specialist in submission["specialists"]:
         name = specialist["name"]
-        prefix = SPECIALIST_ID_PREFIXES[name]
         for item in specialist["findings"]:
             key = (item["category"], item["location"], item["required_outcome"])
-            identifier = prefix + item["id"]
+            identifier = _queued_id(name, item["id"])
             existing = merged.get(key)
             if existing is None:
                 merged[key] = {
@@ -213,10 +237,10 @@ def merged_source_ids(submission: Mapping[str, Any]) -> dict[str, list[str]]:
     """Map each retained finding ID to every specialist ID it represents."""
     mapping: dict[tuple[str, str, str], list[str]] = {}
     for specialist in submission["specialists"]:
-        prefix = SPECIALIST_ID_PREFIXES[specialist["name"]]
+        name = specialist["name"]
         for item in specialist["findings"]:
             key = (item["category"], item["location"], item["required_outcome"])
-            mapping.setdefault(key, []).append(prefix + item["id"])
+            mapping.setdefault(key, []).append(_queued_id(name, item["id"]))
     return {sources[0]: sorted(sources) for sources in mapping.values()}
 
 

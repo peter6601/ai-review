@@ -800,5 +800,23 @@ previous round created the problem."""
                 )
 
 
+class ReviewRepairPromptTests(unittest.TestCase):
+    """Resolutions are matched to queued finding IDs byte for byte."""
+
+    PROMPT = Path(__file__).resolve().parents[1] / "prompts" / "claude-review-fix.md"
+
+    def test_the_repair_must_copy_every_supplied_id_verbatim(self):
+        """Regression (2026-09-22): a repair "corrected" `PF-SWIFTUI-SWIFTUI-101`.
+
+        It answered `PF-SWIFTUI-101`, which matched no queued finding, and a
+        complete, verified repair paused as INVALID_CLAUDE_RESOLUTION.
+        """
+        text = self.PROMPT.read_text(encoding="utf-8")
+
+        self.assertIn("`finding_ids`", text)
+        self.assertIn("character for character", text)
+        self.assertIn("even one that looks redundant", text)
+
+
 if __name__ == "__main__":
     unittest.main()

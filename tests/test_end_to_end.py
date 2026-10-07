@@ -611,7 +611,7 @@ class DirectReviewEndToEndTests(_ExternalHarness, unittest.TestCase):
 
     def test_ios_review_merges_three_specialists_into_one_repair(self):
         specialist_ids = [
-            "PF-RESILIENCE-RESILIENCE-001", "PF-SWIFTUI-SWIFTUI-001", "PF-UX-UX-001",
+            "PF-RESILIENCE-001", "PF-SWIFTUI-001", "PF-UX-001",
         ]
         self.install_fake_models({
             "codex": [
