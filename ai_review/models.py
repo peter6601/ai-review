@@ -1373,7 +1373,8 @@ class RunState:
     def rebind_document(self, new_digest: str) -> None:
         """Point a finished doc review at the document's new bytes, for one more round.
 
-        The human loop is: read the findings, edit the document, ask again.
+        The human loop is: triage the findings, edit the document (or approve
+        Claude's edit of the accepted ones), ask again.
         Only the document moves.  The lens, the reason it was chosen, the
         brief, the frozen base and the evidence packet all stay exactly as they
         were, because the second round is the same review of a changed

@@ -16,7 +16,7 @@
 ### 文件審查
 
 ```text
-文件 → Codex 唯讀審查 → Findings → 人類修改 → 可再次審查
+文件 → Codex 唯讀審查 → Findings → 人類逐條取捨 → Claude 只改採納項（人類看 diff）→ 可再次審查
 ```
 
 審查過程不會修改原文件，也不會執行測試或寫入程式碼。
@@ -81,7 +81,7 @@ Skill 會負責收集必要資訊、建立 run，並在需要人類判斷時停�
 如果要直接操作 CLI，可先用 `ai-review --help` 查看參數。`init` 會輸出 JSON，後續指令使用其中的 `run_id`。
 
 ```text
-文件：init doc → run → status → 人類修改文件 → re-review
+文件：init doc → run → status → 人類取捨 findings → Claude 改採納項、人類核 diff → re-review
 程式碼：init review → approve-review → run → status → 人類 approve-code
 ```
 
@@ -92,7 +92,7 @@ Skill 會負責收集必要資訊、建立 run，並在需要人類判斷時停�
 | 狀態 | 下一步 |
 |---|---|
 | `AWAITING_USER_INPUT` | 準備 answers JSON，執行 `ai-review answer RUN_ID --answers FILE` |
-| `AWAITING_HUMAN_DOC_REVIEW` | 閱讀 findings，並由人類修改文件 |
+| `AWAITING_HUMAN_DOC_REVIEW` | 人類逐條標採納／不採納／自己改；Claude 只改採納項，人類核 diff 後才 `re-review` |
 | `AWAITING_HUMAN_CODE_REVIEW` | 人類閱讀 diff 後執行 `approve-code` |
 | `INTERRUPTED` | 排除外部問題後執行 `ai-review resume RUN_ID` |
 | `PAUSED` | 依 `status` 顯示的原因處理；不要直接重開 run |

@@ -1,7 +1,8 @@
 """One read-only Codex pass over a feature document.
 
 A doc run has no Claude and no repair loop: the findings are the deliverable,
-and a human edits the document and re-runs.  It writes exactly one file into
+and the document is edited — by the human, or by Claude for the findings the
+human accepted after the run halts — before a re-run.  It writes exactly one file into
 the reviewed repository — this round's report, created beside the document and
 never on top of an existing one — and never the document itself.  What lives
 here is only what makes those properties structural: the narrow review input,

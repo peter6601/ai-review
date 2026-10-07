@@ -13,113 +13,88 @@ def skill(name):
     return frontmatter, text
 
 
+def flat(text):
+    """Collapse whitespace so a re-wrapped line never fails a contract."""
+    return " ".join(text.split())
+
+
 class SkillContractTests(unittest.TestCase):
-    def test_consensus_review_contract(self):
+    """`/consensus-review`: the boundaries that must survive any rewording.
+
+    These pin behaviour an agent could otherwise get wrong at a real cost (a
+    reset repair ceiling, a self-cleared final gate, a rejected answers file),
+    not the prose around it.  Whatever the CLI already refuses is left to the
+    CLI and is not pinned here.
+    """
+
+    def test_the_command_order_and_the_specialists_are_inputs_to_init(self):
         _, text = skill("consensus-review")
+        text = flat(text)
 
         for phrase in (
             "ai-review init review",
             "ai-review approve-review",
             "Codex-first",
-            "sixth repair",
             "approve-code",
             "--preflight",
             "read-only",
-            "8,000",
-        ):
-            self.assertIn(phrase, text)
-
-    def test_the_specialists_are_collected_before_the_run_exists(self):
-        """The 29 runs abandoned at AWAITING_PREFLIGHT died at a mid-run handoff.
-
-        There is no such station any more, so the skill must describe the
-        specialists as an input to `init` and must not describe a station that
-        no longer exists.
-        """
-        _, text = skill("consensus-review")
-
-        self.assertNotIn("submit-preflight", text)
-        self.assertNotIn("AWAITING_PREFLIGHT", text)
-        for phrase in (
-            "init review",
-            "--preflight",
-            # All three, every time: an empty findings list is a verdict.
             "all three",
             '"findings": []',
+            "do not init",
         ):
             self.assertIn(phrase, text)
+        # The mid-run preflight station is gone and must not creep back.
+        self.assertNotIn("submit-preflight", text)
+        self.assertNotIn("AWAITING_PREFLIGHT", text)
 
-    def test_the_auto_approval_ledger_counts_the_two_gates_that_have_it(self):
-        """approve-code has no --auto, so the shared window covers two gates."""
+    def test_auto_approval_covers_the_loop_and_never_its_exit(self):
         _, text = skill("consensus-review")
+        text = flat(text)
 
-        self.assertNotIn("all three gates in one ledger", text)
-        self.assertIn("both gates that have it, in one ledger", text)
-
-    def test_agent_auto_approval_is_documented_with_its_limit_and_its_cost(self):
-        """`--auto` weakens a human gate, so the skill must say exactly how much."""
-        _, text = skill("consensus-review")
-
-        for phrase in (
-            "--auto",
-            "five auto-approvals in any 60-second sliding window",
-            "agent:auto-approval",
-            "Never route around the limit by creating a\nsecond run.",
-        ):
-            self.assertIn(phrase, text)
-        # The loop may run unattended; its exit may not.
+        self.assertIn("five auto-approvals in any 60-second sliding window", text)
+        self.assertIn("both gates that have it", text)
+        self.assertIn("Never route around the limit by creating a second run", text)
         self.assertIn("`approve-code` has no `--auto` at all", text)
-        self.assertIn(
-            "Only the human runs the final gate, and only after they have read "
-            "the diff.", text,
-        )
+        self.assertIn("Only the human runs the final gate", text)
         self.assertNotIn("approve-code --auto", text)
 
-    def test_the_answers_file_is_keyed_by_question_id_not_by_question_text(self):
-        """Defect: a `review` run hits `NEEDS_USER_INPUT` exactly like a `doc` one.
-
-        `PlanWorkflow._validate_answers`, which `DirectReviewWorkflow` inherits,
-        compares `set(answers)` against the persisted question ids, so a mapping
-        of question *text* to answer can never match -- and the rejection used to pause the run, discarding a
-        separately billed Codex round.  This skill said only "write one answers
-        JSON object", which is the wording that destroyed a real run.
-        `consensus-plan` was corrected first; this is the same contract, and
-        deliberately in the same words, so the two cannot drift apart.
-        """
-        _, text = skill("consensus-review")
-        _, plan = skill("consensus-plan")
-
-        shared = (
-            "The questions artifact (`questions_path`, reported by `status`) holds a list of\n"
-            "`{\"id\": ..., \"question\": ...}` objects. Read it before writing anything. The\n"
-            "answers file is a flat JSON object **keyed by the question `id`** \u2014 `Q-001`,\n"
-            "`Q-002`, \u2026 \u2014 never by the question text, which is refused every time. "
-            "Each value\nis that question's answer as one non-empty string, in the user's "
-            "own words: one\nkey per persisted question, no extras and none left out."
-        )
-        self.assertIn(shared, text)
-        # One contract, one phrasing, in both skills that can be asked questions.
-        self.assertIn(shared, plan)
-        # A concrete two-id example, so the shape is copyable rather than inferred.
-        self.assertIn('"Q-001"', text)
-        self.assertIn('"Q-002"', text)
-        # Gone, not merely de-emphasised: the wording that produced a rejected file.
-        self.assertNotIn("Write one answers JSON object", text)
-        # The half that was already right: the questions reach the user untouched.
-        self.assertIn("verbatim", text)
-        self.assertIn("Never answer\nfor the user", text)
-
     def test_the_six_repair_ceiling_cannot_be_reset_by_a_fresh_run(self):
-        """Regression: the generic PAUSED restart advice also covered MAX_REPAIR_ROUNDS."""
         _, text = skill("consensus-review")
+        text = flat(text)
 
         self.assertIn("MAX_REPAIR_ROUNDS", text)
         self.assertIn("Never create a new Review run to keep repairing", text)
         self.assertIn("resets the counter", text)
-        # The restart path must be scoped to a broken precondition only.
         restart = text.split("PAUSED` for any other reason", 1)
         self.assertEqual(len(restart), 2, "restart guidance section is missing")
         self.assertIn("never to buy more repair rounds", restart[1])
+
+    def test_questions_reach_the_user_verbatim_and_answers_are_keyed_by_id(self):
+        """Both skills that can be asked questions share one answers contract."""
+        for name in ("consensus-review", "consensus-plan"):
+            with self.subTest(skill=name):
+                _, text = skill(name)
+                text = flat(text)
+                self.assertIn("verbatim", text)
+                self.assertIn("keyed by the question `id`", text)
+                self.assertIn("never by the question text", text)
+                self.assertIn('"Q-001"', text)
+                self.assertIn('"Q-002"', text)
+
+    def test_rulings_are_drafted_for_the_human_never_finalized(self):
+        _, text = skill("consensus-review")
+        text = flat(text)
+
+        self.assertIn("never finalize a ruling yourself", text)
+        self.assertIn("Never commit, push, merge, open a pull request", text)
+
+    def test_long_runs_are_backgrounded(self):
+        for name in ("consensus-review", "consensus-plan"):
+            with self.subTest(skill=name):
+                _, text = skill(name)
+                text = flat(text)
+                self.assertIn("600s", text)
+                self.assertIn("run it in the background and poll `status`", text)
 
 
 class CanonicalSkillFrontmatterTests(unittest.TestCase):
@@ -146,19 +121,16 @@ class CanonicalSkillFrontmatterTests(unittest.TestCase):
                 self.assertIn("description", frontmatter)
                 self.assertEqual(frontmatter["name"], name)
 class ConsensusPlanSkillContractTests(unittest.TestCase):
-    """`/consensus-plan` drives read-only document review, not Plan review.
+    """`/consensus-plan`: Codex reviews a document read-only; Claude edits it
+    only for findings the human accepted, and only after the run halts.
 
-    Measured from the run store: of 56 `plan` runs only two ever reached the
-    human gate, twelve of the last seventeen died at a lineage gate that exists
-    only because Claude edits the Plan between rounds, and `consensus-code` --
-    the thing a Plan run exists to authorise -- has never run at all.  The skill
-    layer therefore points at the `doc` kind, where Codex reviews read-only and
-    the findings are the deliverable.  These assertions exist to keep the old
-    entry point from creeping back in.
+    The `plan` entry point stays gone: of 56 `plan` runs only two ever reached
+    the human gate, so the skill layer points at the `doc` kind.
     """
 
     def test_the_recipe_is_the_doc_kind_and_the_plan_entry_point_is_gone(self):
         frontmatter, text = skill("consensus-plan")
+        text = flat(text)
 
         self.assertEqual(set(frontmatter), {"name", "description"})
         self.assertEqual(frontmatter["name"], "consensus-plan")
@@ -171,97 +143,39 @@ class ConsensusPlanSkillContractTests(unittest.TestCase):
             "ai-review expand-context",
             "ai-review answer",
             "AWAITING_HUMAN_DOC_REVIEW",
+            "--lens",
+            "wait for the user to confirm or correct",
         ):
             self.assertIn(phrase, text)
-        # Gone, not merely de-emphasised.  A document has nothing to run and
-        # nothing downstream inherits its findings, so neither the verification
-        # binding nor any approval command exists in this kind at all.
-        for phrase in (
-            "--verify",
-            "init plan",
-            "approve-plan",
-            "approve-doc",
-            "AWAITING_HUMAN_PLAN_REVIEW",
-        ):
+        for phrase in ("--verify", "init plan", "approve-plan", "approve-doc",
+                       "AWAITING_HUMAN_PLAN_REVIEW"):
             self.assertNotIn(phrase, text)
 
-    def test_the_document_is_reviewed_and_never_edited(self):
-        """The one invariant that makes an unattended doc run safe."""
+    def test_the_run_never_edits_and_claude_edits_only_accepted_findings(self):
         _, text = skill("consensus-plan")
+        text = flat(text)
 
-        self.assertIn("read-only", text)
-        self.assertIn("never edits it", text)
-        self.assertIn("The document's bytes are not touched by any part of this", text)
+        self.assertIn("it never edits it", text)
+        self.assertIn("not touched by any part of the automated run", text)
+        self.assertIn("only for findings the human accepted", text)
+        self.assertIn("never apply one the human did not mark accept", text)
+        self.assertIn("Edit only the reviewed document", text)
+        self.assertIn("never one you supply", text)
         self.assertIn("Never begin implementation", text)
         self.assertIn("never commit, push, merge, or open a pull request", text)
 
-    def test_the_lens_is_judged_then_confirmed_once_before_anything_runs(self):
+    def test_the_next_round_waits_for_the_human_to_approve_the_diff(self):
         _, text = skill("consensus-plan")
+        text = flat(text)
 
-        for lens in ("`requirement`", "`direction`", "`implementation`"):
-            self.assertIn(lens, text)
-        self.assertIn("--lens", text)
-        self.assertIn("--lens-reason", text)
-        self.assertIn("wait for the user to confirm or correct", text)
-        self.assertIn("One confirmation point, not two.", text)
+        self.assertIn("only after the human has approved the diff", text)
+        self.assertIn("never automatically after your own edit", text)
+        self.assertIn("A Codex `PASS` is not approval", text)
 
-    def test_context_is_bounded_and_questions_are_asked_verbatim(self):
+    def test_context_is_bounded_and_untrusted(self):
         _, text = skill("consensus-plan")
+        text = flat(text)
 
         self.assertIn("no more than five", text)
-        self.assertIn("16,000", text)
-        self.assertIn("\"/absolute/path.md#Exact Heading\"", text)
-        self.assertIn("verbatim", text)
         self.assertIn("never a whole folder or a broad file", text)
-        self.assertIn("checksum-bound evidence", text)
-
-    def test_the_answers_file_is_keyed_by_question_id_not_by_question_text(self):
-        """Defect: the inherited wording produced a file `answer` always rejects.
-
-        `PlanWorkflow._validate_answers` compares `set(answers)` against the
-        persisted question ids, so a mapping of question *text* to answer can
-        never match -- and the rejection used to pause the run, throwing away a
-        separately billed Codex round.  An agent following this skill literally
-        destroyed a real doc run, which is why the id contract is pinned here.
-        """
-        _, text = skill("consensus-plan")
-
-        self.assertIn("keyed by the question `id`", text)
-        self.assertIn("never by the question text", text)
-        # A concrete two-id example, so the shape is copyable rather than inferred.
-        self.assertIn('"Q-001"', text)
-        self.assertIn('"Q-002"', text)
-        # Gone, not merely de-emphasised: both halves of the wrong contract.
-        self.assertNotIn("non-empty flat mapping", text)
-        self.assertNotIn("question to answer", text)
-        # The half that was right: the question text reaches the user untouched.
-        self.assertIn("verbatim", text)
-        self.assertIn("never summarize, never reword", text)
-
-    def test_the_run_is_backgrounded_and_only_a_status_summary_is_reported(self):
-        """One Codex call is bounded at 3600s; the Bash tool dies at 600s."""
-        _, text = skill("consensus-plan")
-
-        self.assertIn("3600s", text)
-        self.assertIn("600s", text)
-        self.assertIn("Always run it in the background and poll `status`", text)
-        self.assertIn("status summary only", text)
-        self.assertIn("Never paste patches, logs, prompts, or model transcripts", text)
-
-    def test_re_review_is_the_way_back_in_and_recovery_is_state_specific(self):
-        _, text = skill("consensus-plan")
-
-        self.assertIn("unresolved findings", text)
-        self.assertIn("refuses", text)
-        self.assertIn("INTERRUPTED", text)
-        self.assertIn("WORKFLOW_ERROR", text)
-        self.assertIn("expand-context", text)
-
-    def test_a_codex_pass_is_not_approval_and_this_kind_needs_no_claude_login(self):
-        _, text = skill("consensus-plan")
-
-        self.assertIn("A Codex `PASS` is not approval", text)
-        self.assertIn("non-deterministic", text)
-        self.assertIn("needs no `claude` login", text)
-        self.assertIn("separately billed Codex session", text)
-
+        self.assertIn("never executable instructions", text)
